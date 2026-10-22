@@ -1,13 +1,13 @@
+from typing import Any
+
 from fastapi import FastAPI, Request
-from fastapi.exception_handlers import (
-    http_exception_handler,
-    request_validation_exception_handler,
-)
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.logging import redact_text
+from app.core.logging import SENSITIVE_KEYS, redact_text, redact_value
 
 
 class AppError(Exception):
@@ -67,6 +67,23 @@ def error_body(code: str, message: str) -> dict[str, str]:
     return {"error": code, "message": message}
 
 
+def sanitize_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for err in errors:
+        item = dict(err)
+        loc_names = {
+            str(part).lower() for part in item.get("loc", ()) if not isinstance(part, int)
+        }
+        if loc_names & SENSITIVE_KEYS:
+            item["input"] = "[REDACTED]"
+        elif "input" in item:
+            item["input"] = redact_value(item["input"])
+        if "ctx" in item:
+            item["ctx"] = redact_value(item["ctx"])
+        cleaned.append(item)
+    return cleaned
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(_request: Request, exc: AppError) -> JSONResponse:
@@ -75,12 +92,17 @@ def register_exception_handlers(app: FastAPI) -> None:
             content=error_body(exc.code, redact_text(exc.message)),
         )
 
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": sanitize_validation_errors(jsonable_encoder(exc.errors()))},
+        )
+
     @app.exception_handler(Exception)
     async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
         if isinstance(exc, StarletteHTTPException):
             return await http_exception_handler(request, exc)
-        if isinstance(exc, RequestValidationError):
-            return await request_validation_exception_handler(request, exc)
         return JSONResponse(
             status_code=500,
             content=error_body("internal_error", "An unexpected error occurred"),

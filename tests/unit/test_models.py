@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from app.models.providers import ProviderCreate, ProviderType
 from app.models.requests import AsyncRequestResponse, RequestState
 from app.models.tokens import TokenPayload
@@ -13,6 +16,16 @@ def test_provider_create_json_hides_client_secret() -> None:
     dumped = provider.model_dump(mode="json")
     assert dumped["client_secret"] == "[REDACTED]"
     assert provider.model_dump()["client_secret"] == "super-secret"
+
+
+def test_oidc_provider_requires_issuer_url() -> None:
+    with pytest.raises(ValidationError):
+        ProviderCreate(
+            name="corp",
+            client_id="client",
+            client_secret="secret",
+            provider=ProviderType.OIDC,
+        )
 
 
 def test_async_request_hides_token_unless_succeeded() -> None:

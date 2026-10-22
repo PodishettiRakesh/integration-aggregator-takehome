@@ -1,7 +1,7 @@
 from enum import Enum
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 
 class ProviderType(str, Enum):
@@ -24,6 +24,14 @@ class ProviderCreate(BaseModel):
     @field_serializer("client_secret", when_used="json")
     def hide_secret(self, _value: str) -> str:
         return "[REDACTED]"
+
+    @model_validator(mode="after")
+    def oidc_requires_issuer_url(self) -> Self:
+        if self.provider is ProviderType.OIDC:
+            issuer_url = self.provider_options.get("issuer_url")
+            if not isinstance(issuer_url, str) or not issuer_url.strip():
+                raise ValueError("OIDC providers require provider_options.issuer_url")
+        return self
 
 
 class ProviderPublic(BaseModel):

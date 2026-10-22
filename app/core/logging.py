@@ -6,7 +6,7 @@ from typing import Any
 
 _REDACTED = "[REDACTED]"
 
-_SENSITIVE_KEYS = {
+SENSITIVE_KEYS = {
     "access_token",
     "client_secret",
     "code",
@@ -37,7 +37,7 @@ def redact_text(value: str) -> str:
 
 
 def redact_value(value: Any, key: str | None = None) -> Any:
-    if key is not None and key.lower() in _SENSITIVE_KEYS:
+    if key is not None and key.lower() in SENSITIVE_KEYS:
         return _REDACTED
     if isinstance(value, str):
         return redact_text(value)
