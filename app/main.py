@@ -6,6 +6,8 @@ from fastapi import FastAPI
 from app.api.health import router as health_router
 from app.api.oauth import router as oauth_router
 from app.api.providers import router as providers_router
+from app.api.requests import router as requests_router
+from app.api.tokens import router as tokens_router
 from app.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
@@ -13,6 +15,8 @@ from app.integrations.openbao_oauth import OpenBaoOAuth, OpenBaoOAuthClient
 from app.services.oauth_service import OAuthService
 from app.services.oauth_state import OAuthStateStore
 from app.services.provider_registry import ProviderRegistry
+from app.services.request_manager import RequestManager
+from app.services.token_service import TokenService
 
 
 @asynccontextmanager
@@ -20,6 +24,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        token_service = getattr(app.state, "token_service", None)
+        if token_service is not None:
+            await token_service.aclose()
         openbao = getattr(app.state, "openbao", None)
         if openbao is not None:
             await openbao.aclose()
@@ -32,6 +39,8 @@ def create_app(
     provider_registry: ProviderRegistry | None = None,
     oauth_state: OAuthStateStore | None = None,
     oauth_service: OAuthService | None = None,
+    request_manager: RequestManager | None = None,
+    token_service: TokenService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
     configure_logging(resolved_settings.log_level)
@@ -50,11 +59,20 @@ def create_app(
         states=resolved_states,
         redirect_url=resolved_settings.redirect_url,
     )
+    resolved_requests = request_manager or RequestManager(resolved_settings.request_ttl_seconds)
+    app.state.request_manager = resolved_requests
+    app.state.token_service = token_service or TokenService(
+        registry=resolved_registry,
+        openbao=resolved_openbao,
+        requests=resolved_requests,
+    )
 
     register_exception_handlers(app)
     app.include_router(health_router)
     app.include_router(providers_router)
     app.include_router(oauth_router)
+    app.include_router(requests_router)
+    app.include_router(tokens_router)
     return app
 
 

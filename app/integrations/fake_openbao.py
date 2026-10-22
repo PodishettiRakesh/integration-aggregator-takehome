@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from typing import Any
 
 from app.core.errors import OpenBaoNotFoundError, OpenBaoUnavailableError
@@ -14,6 +16,8 @@ class FakeOpenBaoOAuth:
         self.servers: dict[str, dict[str, Any]] = {}
         self.creds: dict[str, TokenPayload] = {}
         self.stored_codes: dict[str, str] = {}
+        self.read_hold: threading.Event | None = None
+        self.reads: int = 0
 
     async def health(self) -> bool:
         return self.healthy
@@ -69,6 +73,11 @@ class FakeOpenBaoOAuth:
 
     async def read_creds(self, creds_name: str, minimum_seconds: int = 10) -> TokenPayload:
         del minimum_seconds
+        hold = self.read_hold
+        if hold is not None:
+            while not hold.is_set():
+                await asyncio.sleep(0.01)
+        self.reads += 1
         self._ensure_healthy()
         token = self.creds.get(creds_name)
         if token is None:

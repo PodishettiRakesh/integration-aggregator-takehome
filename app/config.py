@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     http_timeout_seconds: float = Field(default=5.0, ge=0.1)
     oauth_state_ttl_seconds: int = Field(default=600, ge=1)
+    request_ttl_seconds: int = Field(default=3600, ge=1)
 
 
 @lru_cache
