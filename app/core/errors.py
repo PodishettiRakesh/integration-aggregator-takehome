@@ -34,6 +34,16 @@ class InvalidOAuthStateError(AppError):
     code = "invalid_oauth_state"
 
 
+class MissingAuthorizationCodeError(AppError):
+    status_code = 400
+    code = "missing_authorization_code"
+
+
+class OAuthProviderError(AppError):
+    status_code = 400
+    code = "oauth_provider_error"
+
+
 class RequestNotFoundError(AppError):
     status_code = 404
     code = "request_not_found"
