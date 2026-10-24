@@ -1,0 +1,91 @@
+# Default values for aggregator
+# This is a YAML-formatted file.
+
+replicaCount: 1
+
+image:
+  repository: integration-aggregator
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Application configuration
+app:
+  port: 8000
+  logLevel: INFO
+  httpTimeoutSeconds: 5.0
+  oauthStateTtlSeconds: 600
+  requestTtlSeconds: 3600
+
+# OpenBao configuration
+openbao:
+  address: http://openbao.openbao.svc.cluster.local:8200
+  mount: oauth2
+  # Token should be supplied from a Kubernetes Secret
+  # Use existingSecret to reference a secret containing OPENBAO_TOKEN key
+  existingSecret: ""
+  # If not using existingSecret, you can create a secret with this value
+  # WARNING: Do not commit actual token values to git
+  token: ""
+
+# OAuth callback redirect URL
+redirectUrl: http://localhost:8000/callback
+
+# Health check configuration
+healthCheck:
+  liveness:
+    initialDelaySeconds: 5
+    periodSeconds: 30
+    timeoutSeconds: 10
+    successThreshold: 1
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    successThreshold: 1
+    failureThreshold: 3
