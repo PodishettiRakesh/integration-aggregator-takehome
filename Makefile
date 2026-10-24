@@ -13,6 +13,8 @@ OPENBAO_NAMESPACE ?= openbao
 OPENBAO_CHART ?= openbao/openbao
 OPENBAO_ADDR ?= http://openbao.openbao.svc.cluster.local:8200
 OAUTHAPP_VERSION ?= v3.0.0
+OAUTHAPP_BINARY_URL ?= https://github.com/openbao/openbao-plugin-secrets-oauthapp/releases/download/$(OAUTHAPP_VERSION)/openbao-plugin-secrets-oauthapp_$(OAUTHAPP_VERSION)_linux_amd64.zip
+OAUTHAPP_SHA256 ?= # Set this to the actual SHA-256 of the binary
 MOCK_OAUTH_RELEASE ?= mock-oauth
 MOCK_OAUTH_CHART ?= oci://ghcr.io/navikt/mock-oauth2-server
 
@@ -83,16 +85,60 @@ openbao-up: minikube-start ## Deploy OpenBao with oauthapp plugin
 		--set server.standalone.enabled=true \
 		--set server.dev.enabled=true \
 		--set server.dev.rootToken="dev-only-token" \
+		--set ui.enabled=true \
 		--wait
 	@echo "$(GREEN)OpenBao deployed$(NC)"
+	@$(MAKE) openbao-plugin-register
+
+.PHONY: openbao-plugin-register
+openbao-plugin-register: ## Register oauthapp plugin and configure secrets engine
 	@echo "$(BLUE)Configuring oauthapp plugin...$(NC)"
-	@# Note: Plugin registration steps would go here
-	@# This is a placeholder - actual implementation requires:
-	@# - Download oauthapp binary
-	@# - Register plugin in OpenBao catalog
-	@# - Enable secrets engine
-	@# - Create policy and token
-	@echo "$(YELLOW)Plugin registration not yet implemented$(NC)"
+	@# Wait for OpenBao to be ready
+	@kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=openbao -n $(OPENBAO_NAMESPACE) --timeout=120s
+	@# Port-forward to access OpenBao CLI
+	@kubectl port-forward -n $(OPENBAO_NAMESPACE) svc/$(OPENBAO_RELEASE) 8200:8200 > /dev/null 2>&1 &
+	@PF_PID=$$!; \
+	sleep 5; \
+	export VAULT_ADDR="http://127.0.0.1:8200"; \
+	export VAULT_TOKEN="dev-only-token"; \
+	\
+	# Download oauthapp binary if not present in plugin directory
+	echo "$(BLUE)Downloading oauthapp binary...$(NC)"; \
+	kubectl exec -n $(OPENBAO_NAMESPACE) deployment/$(OPENBAO_RELEASE) -- sh -c ' \
+		if [ ! -f /vault/plugins/oauthapp ]; then \
+			cd /tmp && \
+			curl -L -o oauthapp.zip "$(OAUTHAPP_BINARY_URL)" && \
+			unzip -o oauthapp.zip && \
+			mv openbao-plugin-secrets-oauthapp /vault/plugins/oauthapp && \
+			chmod +x /vault/plugins/oauthapp && \
+			rm -f oauthapp.zip; \
+		fi'; \
+	\
+	# Calculate SHA-256 and register plugin
+	echo "$(BLUE)Registering plugin in catalog...$(NC)"; \
+	SHA256=$$(kubectl exec -n $(OPENBAO_NAMESPACE) deployment/$(OPENBAO_RELEASE) -- sha256sum /vault/plugins/oauthapp | awk '{print $$1}'); \
+	vault plugin register -sha256="$$SHA256" secret oauthapp; \
+	\
+	# Enable secrets engine if not already enabled
+	echo "$(BLUE)Enabling oauthapp secrets engine...$(NC)"; \
+	vault secrets enable -path=oauth2 oauthapp 2>/dev/null || echo "Secrets engine already enabled"; \
+	\
+	# Create least-privilege policy for aggregator
+	echo "$(BLUE)Creating aggregator policy...$(NC)"; \
+	vault policy write aggregator - <<EOF
+	path "oauth2/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+EOF
+	\
+	# Create child token for aggregator
+	echo "$(BLUE)Creating aggregator token...$(NC)"; \
+	AGGREGATOR_TOKEN=$$(vault token create -policy=aggregator -format=json -ttl=24h | jq -r '.auth.client_token'); \
+	echo "$$AGGREGATOR_TOKEN" > /tmp/openbao-aggregator-token.txt; \
+	echo "$(GREEN)Plugin configuration complete$(NC)"; \
+	echo "$(YELLOW)Aggregator token saved to /tmp/openbao-aggregator-token.txt$(NC)"; \
+	\
+	kill $$PF_PID 2>/dev/null || true
 
 .PHONY: secret-create
 secret-create: ## Create Kubernetes Secret for OpenBao token
@@ -152,14 +198,23 @@ mock-oauth-down: ## Remove mock OAuth2 server
 	@echo "$(GREEN)Mock OAuth2 server removed$(NC)"
 
 .PHONY: down
-down: ## Tear down all deployed resources
-	@echo "$(BLUE)Tearing down deployment...$(NC)"
+down: ## Tear down aggregator and mock OAuth2 only (preserves OpenBao)
+	@echo "$(BLUE)Tearing down aggregator deployment...$(NC)"
 	@helm uninstall $(RELEASE_NAME) --namespace $(NAMESPACE) || true
 	@helm uninstall $(MOCK_OAUTH_RELEASE) --namespace $(NAMESPACE) || true
-	@helm uninstall $(OPENBAO_RELEASE) --namespace $(OPENBAO_NAMESPACE) || true
+	@kubectl delete secret $(RELEASE_NAME)-openbao --namespace $(NAMESPACE) --ignore-not-found=true || true
 	@kubectl delete namespace $(NAMESPACE) --ignore-not-found=true || true
+	@echo "$(GREEN)Aggregator teardown complete$(NC)"
+	@echo "$(YELLOW)Note: OpenBao is preserved. Remove it with: make infra-down$(NC)"
+	@echo "$(YELLOW)Note: minikube cluster is still running. Stop it with: minikube stop$(NC)"
+
+.PHONY: infra-down
+infra-down: ## Tear down OpenBao infrastructure (namespace, release, configuration)
+	@echo "$(BLUE)Tearing down OpenBao infrastructure...$(NC)"
+	@helm uninstall $(OPENBAO_RELEASE) --namespace $(OPENBAO_NAMESPACE) || true
 	@kubectl delete namespace $(OPENBAO_NAMESPACE) --ignore-not-found=true || true
-	@echo "$(GREEN)Teardown complete$(NC)"
+	@rm -f /tmp/openbao-aggregator-token.txt
+	@echo "$(GREEN)OpenBao infrastructure teardown complete$(NC)"
 	@echo "$(YELLOW)Note: minikube cluster is still running. Stop it with: minikube stop$(NC)"
 
 .PHONY: smoke
