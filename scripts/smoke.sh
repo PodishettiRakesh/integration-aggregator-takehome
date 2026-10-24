@@ -5,12 +5,14 @@
 # Note: This script requires a Bash-compatible environment. It does not run natively in PowerShell.
 
 set -e
+set -o pipefail
 
 # Configuration
 AGGREGATOR_URL="${AGGREGATOR_URL:-http://localhost:8000}"
 NAMESPACE="${NAMESPACE:-aggregator}"
 RELEASE_NAME="${RELEASE_NAME:-aggregator}"
 MOCK_OAUTH_RELEASE="${MOCK_OAUTH_RELEASE:-mock-oauth}"
+MOCK_OAUTH_URL="${MOCK_OAUTH_URL:-http://localhost:8080/default}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-30}"
 POLL_INTERVAL="${POLL_INTERVAL:-1}"
 
@@ -32,12 +34,12 @@ log_info() {
 
 log_pass() {
     echo -e "${GREEN}[PASS]${NC} $1"
-    ((TESTS_PASSED++))
+    TESTS_PASSED=$((TESTS_PASSED + 1)) || true
 }
 
 log_fail() {
     echo -e "${RED}[FAIL]${NC} $1"
-    ((TESTS_FAILED++))
+    TESTS_FAILED=$((TESTS_FAILED + 1)) || true
 }
 
 log_warn() {
@@ -93,10 +95,11 @@ test_healthz() {
 test_readyz() {
     log_info "Testing /readyz endpoint..."
     
-    response=$(curl -s "$AGGREGATOR_URL/readyz")
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$AGGREGATOR_URL/readyz")
-    status=$(echo "$response" | jq -r '.status // empty')
-    openbao_status=$(echo "$response" | jq -r '.openbao // empty')
+    response=$(curl -s -w "\n%{http_code}" "$AGGREGATOR_URL/readyz")
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n-1)
+    status=$(echo "$body" | jq -r '.status // empty')
+    openbao_status=$(echo "$body" | jq -r '.openbao // empty')
     
     if [ "$http_code" = "200" ] && [ "$status" = "ready" ] && [ "$openbao_status" = "up" ]; then
         log_pass "/readyz returned status: ready, openbao: up"
@@ -115,8 +118,9 @@ test_provider_registration() {
     log_info "Testing provider registration..."
     
     # Register a mock OIDC provider
+    # Note: issuer_url uses Kubernetes DNS because OpenBao runs in-cluster and needs to reach it
     provider_name="test-oidc-$(date +%s)"
-    response=$(curl -s -X POST "$AGGREGATOR_URL/providers" \
+    response=$(curl -s -w "\n%{http_code}" -X POST "$AGGREGATOR_URL/providers" \
         -H "Content-Type: application/json" \
         -d "{
             \"name\": \"$provider_name\",
@@ -129,29 +133,19 @@ test_provider_registration() {
             }
         }")
     
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$AGGREGATOR_URL/providers" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"name\": \"$provider_name\",
-            \"provider\": \"oidc\",
-            \"client_id\": \"test-client-id\",
-            \"client_secret\": \"test-client-secret\",
-            \"scopes\": [\"openid\", \"profile\"],
-            \"provider_options\": {
-                \"issuer_url\": \"http://mock-oauth.$NAMESPACE.svc.cluster.local:8080/default\"
-            }
-        }")
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n-1)
     
     if [ "$http_code" = "201" ]; then
         # Verify response doesn't contain client_secret
-        if echo "$response" | jq -e '.client_secret' &> /dev/null; then
+        if echo "$body" | jq -e '.client_secret' &> /dev/null; then
             log_fail "Provider registration response contains client_secret (should be redacted)"
             return 1
         fi
         log_pass "Provider registered successfully: $provider_name"
         echo "$provider_name"
     else
-        log_fail "Provider registration failed (HTTP $http_code): $response"
+        log_fail "Provider registration failed (HTTP $http_code): $body"
         return 1
     fi
 }
@@ -161,23 +155,25 @@ test_oauth_connect() {
     local provider_name="$1"
     log_info "Testing OAuth connect for provider: $provider_name"
 
-    response=$(curl -s -X POST "$AGGREGATOR_URL/providers/$provider_name/users/test-user/connect")
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$AGGREGATOR_URL/providers/$provider_name/users/test-user/connect")
+    response=$(curl -s -w "\n%{http_code}" -X POST "$AGGREGATOR_URL/providers/$provider_name/users/test-user/connect")
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n-1)
 
     if [ "$http_code" = "200" ]; then
-        auth_url=$(echo "$response" | jq -r '.authorization_url // empty')
-        state=$(echo "$response" | jq -r '.state // empty')
+        auth_url=$(echo "$body" | jq -r '.authorization_url // empty')
+        state=$(echo "$body" | jq -r '.state // empty')
 
         if [ -n "$auth_url" ] && [ -n "$state" ]; then
             log_pass "OAuth connect successful, state received"
             log_info "Authorization URL: $auth_url"
-            echo "$state"
+            # Return both auth_url and state as space-separated values
+            echo "$auth_url $state"
         else
-            log_fail "OAuth connect response missing authorization_url or state: $response"
+            log_fail "OAuth connect response missing authorization_url or state: $body"
             return 1
         fi
     else
-        log_fail "OAuth connect failed (HTTP $http_code): $response"
+        log_fail "OAuth connect failed (HTTP $http_code): $body"
         return 1
     fi
 }
@@ -185,11 +181,12 @@ test_oauth_connect() {
 # Test callback with mock OAuth2
 test_callback() {
     local provider_name="$1"
-    local original_state="$2"
+    local original_auth_url="$2"
+    local original_state="$3"
     log_info "Testing OAuth callback..."
 
-    # Get the authorization URL from the connect response
-    auth_url=$(curl -s -X POST "$AGGREGATOR_URL/providers/$provider_name/users/test-user/connect" | jq -r '.authorization_url // empty')
+    # Use the authorization URL passed in (reused from connect)
+    auth_url="$original_auth_url"
     
     if [ -z "$auth_url" ]; then
         log_fail "Failed to get authorization URL"
@@ -232,20 +229,21 @@ test_callback() {
     
     # Call aggregator callback with the authorization code
     log_info "Calling aggregator callback..."
-    response=$(curl -s "$AGGREGATOR_URL/callback?code=$code&state=$returned_state")
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$AGGREGATOR_URL/callback?code=$code&state=$returned_state")
+    response=$(curl -s -w "\n%{http_code}" "$AGGREGATOR_URL/callback?code=$code&state=$returned_state")
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n-1)
     
     if [ "$http_code" = "200" ]; then
-        callback_status=$(echo "$response" | jq -r '.status // empty')
+        callback_status=$(echo "$body" | jq -r '.status // empty')
         if [ "$callback_status" = "connected" ]; then
             log_pass "OAuth callback successful"
         else
             log_fail "OAuth callback returned unexpected status: $callback_status"
-            log_fail "Response: $response"
+            log_fail "Response: $body"
             return 1
         fi
     else
-        log_fail "OAuth callback failed (HTTP $http_code): $response"
+        log_fail "OAuth callback failed (HTTP $http_code): $body"
         return 1
     fi
 }
@@ -255,22 +253,22 @@ test_token_request() {
     local provider_name="$1"
     log_info "Testing async token request for provider: $provider_name"
     
-    response=$(curl -s "$AGGREGATOR_URL/$provider_name/test-user")
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$AGGREGATOR_URL/$provider_name/test-user")
+    response=$(curl -s -w "\n%{http_code}" "$AGGREGATOR_URL/$provider_name/test-user")
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n-1)
     
     if [ "$http_code" = "202" ]; then
-        request_id=$(echo "$response" | jq -r '.request_id // empty')
-        location=$(curl -s -o /dev/null -w "%{header_location}" "$AGGREGATOR_URL/$provider_name/test-user")
+        request_id=$(echo "$body" | jq -r '.request_id // empty')
         
         if [ -n "$request_id" ]; then
             log_pass "Token request accepted, request_id: $request_id"
             echo "$request_id"
         else
-            log_fail "Token request response missing request_id: $response"
+            log_fail "Token request response missing request_id: $body"
             return 1
         fi
     else
-        log_fail "Token request failed (HTTP $http_code): $response"
+        log_fail "Token request failed (HTTP $http_code): $body"
         return 1
     fi
 }
@@ -342,14 +340,18 @@ main() {
     fi
     
     # OAuth connect
-    state=$(test_oauth_connect "$provider_name")
+    connect_result=$(test_oauth_connect "$provider_name")
     if [ $? -ne 0 ]; then
         print_summary
         exit 1
     fi
     
+    # Parse auth_url and state from connect result
+    auth_url=$(echo "$connect_result" | awk '{print $1}')
+    state=$(echo "$connect_result" | awk '{print $2}')
+    
     # OAuth callback
-    test_callback "$provider_name" "$state"
+    test_callback "$provider_name" "$auth_url" "$state"
     if [ $? -ne 0 ]; then
         log_warn "Callback test failed - skipping token request test"
         print_summary

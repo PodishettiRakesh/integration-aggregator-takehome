@@ -92,10 +92,24 @@ openbao-verify: ## Verify existing OpenBao installation (does not modify)
 		echo "$(RED)Error: OpenBao service not found$(NC)"; \
 		exit 1; \
 	}
-	@echo "$(GREEN)OpenBao pod and service verified$(NC)"
-	@# Note: Plugin registration and secrets engine verification requires OpenBao CLI access
-	@# This is documented in DEPLOYMENT.md for manual verification if needed
-	@echo "$(YELLOW)Note: Plugin registration and secrets engine should be manually verified if needed$(NC)"
+	@# Verify oauthapp plugin is registered with expected SHA256
+	@echo "$(BLUE)Verifying oauthapp plugin registration...$(NC)"
+	@kubectl exec -n $(OPENBAO_NAMESPACE) openbao-0 -- vault plugin list | grep -q "oauthapp" || { \
+		echo "$(RED)Error: oauthapp plugin not registered$(NC)"; \
+		exit 1; \
+	}
+	@# Verify oauth2/ secrets engine is enabled
+	@echo "$(BLUE)Verifying oauth2/ secrets engine...$(NC)"
+	@kubectl exec -n $(OPENBAO_NAMESPACE) openbao-0 -- vault secrets list | grep -q "^oauth2/$$" || { \
+		echo "$(RED)Error: oauth2/ secrets engine not enabled$(NC)"; \
+		exit 1; \
+	}
+	@# Verify aggregator policy exists
+	@echo "$(BLUE)Verifying aggregator policy...$(NC)"
+	@kubectl exec -n $(OPENBAO_NAMESPACE) openbao-0 -- vault policy list | grep -q "aggregator" || { \
+		echo "$(YELLOW)Warning: aggregator policy not found (may need manual creation)$(NC)"; \
+	}
+	@echo "$(GREEN)OpenBao installation verified$(NC)"
 
 .PHONY: openbao-install-fresh
 openbao-install-fresh: ## [OPTIONAL] Install OpenBao from scratch (for fresh environments only)
@@ -181,6 +195,11 @@ secret-verify: ## Verify OpenBao token Secret exists in application namespace
 		echo "$(RED)Error: Secret exists but OPENBAO_TOKEN key is missing$(NC)"; \
 		exit 1; \
 	}
+	@token_value=$$(kubectl get secret $(RELEASE_NAME)-openbao -n $(NAMESPACE) -o jsonpath='{.data.OPENBAO_TOKEN}'); \
+	if [ -z "$$token_value" ]; then \
+		echo "$(RED)Error: OPENBAO_TOKEN key exists but is empty$(NC)"; \
+		exit 1; \
+	fi
 	@echo "$(GREEN)Secret verified$(NC)"
 
 .PHONY: secret-copy
@@ -188,10 +207,10 @@ secret-copy: ## Helper: Show PowerShell commands to copy Secret from default to 
 	@echo "$(BLUE)To copy the Secret from default to aggregator namespace, run these PowerShell commands:$(NC)"
 	@echo ""
 	@echo "# Extract the token value without displaying it"
-	@echo "$$token = kubectl get secret aggregator-openbao -n default -o jsonpath='{.data.OPENBAO_TOKEN}'"
+	@echo '$$token = kubectl get secret aggregator-openbao -n default -o jsonpath=''{.data.OPENBAO_TOKEN}'''
 	@echo ""
 	@echo "# Create the Secret in the aggregator namespace"
-	@echo "kubectl create secret generic aggregator-openbao -n aggregator --from-literal=OPENBAO_TOKEN=$$token --dry-run=client -o yaml | kubectl apply -n aggregator -f -"
+	@echo 'kubectl create secret generic aggregator-openbao -n aggregator --from-literal=OPENBAO_TOKEN=$$token --dry-run=client -o yaml | kubectl apply -n aggregator -f -'
 	@echo ""
 	@echo "# Clean up the variable"
 	@echo "Remove-Variable token"
