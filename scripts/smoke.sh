@@ -2,12 +2,13 @@
 # Smoke test for Integration Aggregator
 # Requires: curl, jq, kubectl
 # Assumes aggregator is deployed and accessible via port-forward or service
+# Note: This script requires a Bash-compatible environment. It does not run natively in PowerShell.
 
 set -e
 
 # Configuration
 AGGREGATOR_URL="${AGGREGATOR_URL:-http://localhost:8000}"
-NAMESPACE="${NAMESPACE:-default}"
+NAMESPACE="${NAMESPACE:-aggregator}"
 RELEASE_NAME="${RELEASE_NAME:-aggregator}"
 MOCK_OAUTH_RELEASE="${MOCK_OAUTH_RELEASE:-mock-oauth}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-30}"
@@ -124,7 +125,7 @@ test_provider_registration() {
             \"client_secret\": \"test-client-secret\",
             \"scopes\": [\"openid\", \"profile\"],
             \"provider_options\": {
-                \"issuer_url\": \"http://mock-oauth.$NAMESPACE.svc.cluster.local:8080\"
+                \"issuer_url\": \"http://mock-oauth.$NAMESPACE.svc.cluster.local:8080/default\"
             }
         }")
     
@@ -137,7 +138,7 @@ test_provider_registration() {
             \"client_secret\": \"test-client-secret\",
             \"scopes\": [\"openid\", \"profile\"],
             \"provider_options\": {
-                \"issuer_url\": \"http://mock-oauth.$NAMESPACE.svc.cluster.local:8080\"
+                \"issuer_url\": \"http://mock-oauth.$NAMESPACE.svc.cluster.local:8080/default\"
             }
         }")
     
@@ -159,16 +160,17 @@ test_provider_registration() {
 test_oauth_connect() {
     local provider_name="$1"
     log_info "Testing OAuth connect for provider: $provider_name"
-    
+
     response=$(curl -s -X POST "$AGGREGATOR_URL/providers/$provider_name/users/test-user/connect")
     http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$AGGREGATOR_URL/providers/$provider_name/users/test-user/connect")
-    
+
     if [ "$http_code" = "200" ]; then
         auth_url=$(echo "$response" | jq -r '.authorization_url // empty')
         state=$(echo "$response" | jq -r '.state // empty')
-        
+
         if [ -n "$auth_url" ] && [ -n "$state" ]; then
             log_pass "OAuth connect successful, state received"
+            log_info "Authorization URL: $auth_url"
             echo "$state"
         else
             log_fail "OAuth connect response missing authorization_url or state: $response"
@@ -183,17 +185,55 @@ test_oauth_connect() {
 # Test callback with mock OAuth2
 test_callback() {
     local provider_name="$1"
-    local state="$2"
+    local original_state="$2"
     log_info "Testing OAuth callback..."
+
+    # Get the authorization URL from the connect response
+    auth_url=$(curl -s -X POST "$AGGREGATOR_URL/providers/$provider_name/users/test-user/connect" | jq -r '.authorization_url // empty')
     
-    # Get mock OAuth2 service URL
-    mock_oauth_url="http://mock-oauth.$NAMESPACE.svc.cluster.local:8080"
+    if [ -z "$auth_url" ]; then
+        log_fail "Failed to get authorization URL"
+        return 1
+    fi
+
+    log_info "Requesting authorization code from mock OAuth2 server..."
+    # Call authorize endpoint without following redirects, capture Location header
+    redirect_url=$(curl -s -w "%{redirect_url}" -o /dev/null "$auth_url")
     
-    # Simulate callback by directly calling the aggregator's callback endpoint
-    # In a real scenario, the IdP would redirect here with code and state
-    # For smoke test, we'll simulate a successful callback
-    response=$(curl -s "$AGGREGATOR_URL/callback?code=test-auth-code&state=$state")
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$AGGREGATOR_URL/callback?code=test-auth-code&state=$state")
+    if [ -z "$redirect_url" ]; then
+        log_fail "No redirect URL received from authorize endpoint"
+        return 1
+    fi
+
+    log_info "Redirect URL received: $redirect_url"
+    
+    # Extract authorization code from redirect URL using portable utilities
+    # URL format: http://localhost:8000/callback?code=xxx&state=yyy
+    code=$(echo "$redirect_url" | sed 's/.*code=\([^&]*\).*/\1/')
+    returned_state=$(echo "$redirect_url" | sed 's/.*state=\([^&]*\).*/\1/')
+    
+    if [ -z "$code" ]; then
+        log_fail "Failed to extract authorization code from redirect URL"
+        return 1
+    fi
+    
+    if [ -z "$returned_state" ]; then
+        log_fail "Failed to extract state from redirect URL"
+        return 1
+    fi
+
+    # Verify state matches
+    if [ "$returned_state" != "$original_state" ]; then
+        log_fail "State mismatch: expected $original_state, got $returned_state"
+        return 1
+    fi
+    
+    log_pass "State verified, authorization code received"
+    
+    # Call aggregator callback with the authorization code
+    log_info "Calling aggregator callback..."
+    response=$(curl -s "$AGGREGATOR_URL/callback?code=$code&state=$returned_state")
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$AGGREGATOR_URL/callback?code=$code&state=$returned_state")
     
     if [ "$http_code" = "200" ]; then
         callback_status=$(echo "$response" | jq -r '.status // empty')
@@ -201,6 +241,7 @@ test_callback() {
             log_pass "OAuth callback successful"
         else
             log_fail "OAuth callback returned unexpected status: $callback_status"
+            log_fail "Response: $response"
             return 1
         fi
     else
@@ -310,8 +351,9 @@ main() {
     # OAuth callback
     test_callback "$provider_name" "$state"
     if [ $? -ne 0 ]; then
-        log_warn "Callback failed - this may be expected without real IdP interaction"
-        log_warn "Proceeding with token request test anyway..."
+        log_warn "Callback test failed - skipping token request test"
+        print_summary
+        exit 1
     fi
     
     # Token request
