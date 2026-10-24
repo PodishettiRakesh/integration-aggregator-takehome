@@ -4,17 +4,26 @@
 # Assumes aggregator is deployed and accessible via port-forward or service
 # Note: This script requires a Bash-compatible environment. It does not run natively in PowerShell.
 
-set -e
 set -o pipefail
+
+# Cleanup trap
+cleanup() {
+    if [ -n "$PF_PID" ]; then
+        kill "$PF_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
 
 # Configuration
 AGGREGATOR_URL="${AGGREGATOR_URL:-http://localhost:8000}"
 NAMESPACE="${NAMESPACE:-aggregator}"
 RELEASE_NAME="${RELEASE_NAME:-aggregator}"
 MOCK_OAUTH_RELEASE="${MOCK_OAUTH_RELEASE:-mock-oauth}"
-MOCK_OAUTH_URL="${MOCK_OAUTH_URL:-http://localhost:8080/default}"
+# Service name for mock-oauth2-server chart (Helm 3 defaults to release name)
+MOCK_OAUTH_SERVICE="${MOCK_OAUTH_SERVICE:-mock-oauth}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-30}"
 POLL_INTERVAL="${POLL_INTERVAL:-1}"
+CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
 
 # Colors
 RED='\033[0;31m'
@@ -27,23 +36,23 @@ NC='\033[0m' # No Color
 TESTS_PASSED=0
 TESTS_FAILED=0
 
-# Helper functions
+# Helper functions (all logging to stderr to avoid mixing with return values)
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
 }
 
 log_pass() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-    TESTS_PASSED=$((TESTS_PASSED + 1)) || true
+    echo -e "${GREEN}[PASS]${NC} $1" >&2
+    TESTS_PASSED=$((TESTS_PASSED + 1))
 }
 
 log_fail() {
-    echo -e "${RED}[FAIL]${NC} $1"
-    TESTS_FAILED=$((TESTS_FAILED + 1)) || true
+    echo -e "${RED}[FAIL]${NC} $1" >&2
+    TESTS_FAILED=$((TESTS_FAILED + 1))
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
 }
 
 # Check if required tools are available
@@ -51,15 +60,15 @@ check_tools() {
     log_info "Checking required tools..."
     if ! command -v curl &> /dev/null; then
         log_fail "curl not found"
-        exit 1
+        return 1
     fi
     if ! command -v jq &> /dev/null; then
         log_fail "jq not found"
-        exit 1
+        return 1
     fi
     if ! command -v kubectl &> /dev/null; then
         log_fail "kubectl not found"
-        exit 1
+        return 1
     fi
     log_pass "All required tools available"
 }
@@ -68,11 +77,12 @@ check_tools() {
 check_reachability() {
     log_info "Checking aggregator reachability at $AGGREGATOR_URL..."
     
-    if curl -sf -o /dev/null -w "%{http_code}" "$AGGREGATOR_URL/healthz" | grep -q "200"; then
+    http_code=$(curl -sf -o /dev/null -w "%{http_code}" "$AGGREGATOR_URL/healthz")
+    if [ "$http_code" = "200" ]; then
         log_pass "Aggregator is reachable"
     else
-        log_fail "Aggregator is not reachable at $AGGREGATOR_URL"
-        exit 1
+        log_fail "Aggregator is not reachable at $AGGREGATOR_URL (HTTP $http_code)"
+        return 1
     fi
 }
 
@@ -86,7 +96,7 @@ test_healthz() {
     if [ "$status" = "ok" ]; then
         log_pass "/healthz returned status: ok"
     else
-        log_fail "/healthz unexpected response: $response"
+        log_fail "/healthz unexpected response (status: $status): $response"
         return 1
     fi
 }
@@ -104,14 +114,20 @@ test_readyz() {
     if [ "$http_code" = "200" ] && [ "$status" = "ready" ] && [ "$openbao_status" = "up" ]; then
         log_pass "/readyz returned status: ready, openbao: up"
     elif [ "$http_code" = "503" ]; then
-        log_warn "/readyz returned 503 - OpenBao may not be ready"
-        log_warn "Response: $response"
+        log_fail "/readyz returned 503 - OpenBao dependency failure (status: $status, openbao: $openbao_status)"
         return 1
     else
-        log_fail "/readyz unexpected response (HTTP $http_code): $response"
+        log_fail "/readyz unexpected response (HTTP $http_code, status: $status, openbao: $openbao_status): $body"
         return 1
     fi
 }
+
+# Global variables for test results
+PROVIDER_NAME=""
+AUTH_URL=""
+STATE=""
+REQUEST_ID=""
+PF_PID=""
 
 # Test provider registration
 test_provider_registration() {
@@ -119,11 +135,11 @@ test_provider_registration() {
     
     # Register a mock OIDC provider
     # Note: issuer_url uses Kubernetes DNS because OpenBao runs in-cluster and needs to reach it
-    provider_name="test-oidc-$(date +%s)"
+    PROVIDER_NAME="test-oidc-$(date +%s)"
     response=$(curl -s -w "\n%{http_code}" -X POST "$AGGREGATOR_URL/providers" \
         -H "Content-Type: application/json" \
         -d "{
-            \"name\": \"$provider_name\",
+            \"name\": \"$PROVIDER_NAME\",
             \"provider\": \"oidc\",
             \"client_id\": \"test-client-id\",
             \"client_secret\": \"test-client-secret\",
@@ -140,62 +156,75 @@ test_provider_registration() {
         # Verify response doesn't contain client_secret
         if echo "$body" | jq -e '.client_secret' &> /dev/null; then
             log_fail "Provider registration response contains client_secret (should be redacted)"
+            PROVIDER_NAME=""
             return 1
         fi
-        log_pass "Provider registered successfully: $provider_name"
-        echo "$provider_name"
+        log_pass "Provider registered successfully: $PROVIDER_NAME"
     else
         log_fail "Provider registration failed (HTTP $http_code): $body"
+        PROVIDER_NAME=""
         return 1
     fi
 }
 
 # Test OAuth connect flow
 test_oauth_connect() {
-    local provider_name="$1"
-    log_info "Testing OAuth connect for provider: $provider_name"
+    log_info "Testing OAuth connect for provider: $PROVIDER_NAME"
 
-    response=$(curl -s -w "\n%{http_code}" -X POST "$AGGREGATOR_URL/providers/$provider_name/users/test-user/connect")
+    response=$(curl -s -w "\n%{http_code}" -X POST "$AGGREGATOR_URL/providers/$PROVIDER_NAME/users/test-user/connect")
     http_code=$(echo "$response" | tail -n1)
     body=$(echo "$response" | head -n-1)
 
     if [ "$http_code" = "200" ]; then
-        auth_url=$(echo "$body" | jq -r '.authorization_url // empty')
-        state=$(echo "$body" | jq -r '.state // empty')
+        AUTH_URL=$(echo "$body" | jq -r '.authorization_url // empty')
+        STATE=$(echo "$body" | jq -r '.state // empty')
 
-        if [ -n "$auth_url" ] && [ -n "$state" ]; then
+        if [ -n "$AUTH_URL" ] && [ -n "$STATE" ]; then
             log_pass "OAuth connect successful, state received"
-            log_info "Authorization URL: $auth_url"
-            # Return both auth_url and state as space-separated values
-            echo "$auth_url $state"
+            log_info "Authorization URL: $AUTH_URL"
         else
             log_fail "OAuth connect response missing authorization_url or state: $body"
+            AUTH_URL=""
+            STATE=""
             return 1
         fi
     else
         log_fail "OAuth connect failed (HTTP $http_code): $body"
+        AUTH_URL=""
+        STATE=""
         return 1
     fi
 }
 
 # Test callback with mock OAuth2
 test_callback() {
-    local provider_name="$1"
-    local original_auth_url="$2"
-    local original_state="$3"
     log_info "Testing OAuth callback..."
 
-    # Use the authorization URL passed in (reused from connect)
-    auth_url="$original_auth_url"
-    
-    if [ -z "$auth_url" ]; then
+    if [ -z "$AUTH_URL" ]; then
         log_fail "Failed to get authorization URL"
         return 1
     fi
 
+    # Port-forward mock OAuth service to make it reachable from host
+    log_info "Setting up port-forward to mock OAuth service..."
+    kubectl port-forward -n "$NAMESPACE" svc/"$MOCK_OAUTH_SERVICE" 8080:8080 > /dev/null 2>&1 &
+    PF_PID=$!
+    sleep 2
+
+    # Replace cluster DNS with localhost in auth_url for host access
+    host_auth_url=$(echo "$AUTH_URL" | sed "s|mock-oauth.$NAMESPACE.svc.cluster.local:8080|localhost:8080|g")
+    log_info "Host-accessible authorization URL: $host_auth_url"
+
     log_info "Requesting authorization code from mock OAuth2 server..."
-    # Call authorize endpoint without following redirects, capture Location header
-    redirect_url=$(curl -s -w "%{redirect_url}" -o /dev/null "$auth_url")
+    # Call authorize endpoint, capture HTTP status and redirect URL
+    response=$(curl -s -w "\n%{http_code}" --max-time "$CURL_TIMEOUT" "$host_auth_url")
+    http_code=$(echo "$response" | tail -n1)
+    redirect_url=$(echo "$response" | head -n-1)
+    
+    if [ "$http_code" != "302" ] && [ "$http_code" != "301" ]; then
+        log_fail "Authorization endpoint returned unexpected HTTP status: $http_code (expected redirect)"
+        return 1
+    fi
     
     if [ -z "$redirect_url" ]; then
         log_fail "No redirect URL received from authorize endpoint"
@@ -204,7 +233,13 @@ test_callback() {
 
     log_info "Redirect URL received: $redirect_url"
     
-    # Extract authorization code from redirect URL using portable utilities
+    # Verify redirect points to the configured callback
+    if ! echo "$redirect_url" | grep -q "callback"; then
+        log_fail "Redirect does not point to callback endpoint: $redirect_url"
+        return 1
+    fi
+    
+    # Extract authorization code and state from redirect URL
     # URL format: http://localhost:8000/callback?code=xxx&state=yyy
     code=$(echo "$redirect_url" | sed 's/.*code=\([^&]*\).*/\1/')
     returned_state=$(echo "$redirect_url" | sed 's/.*state=\([^&]*\).*/\1/')
@@ -220,8 +255,8 @@ test_callback() {
     fi
 
     # Verify state matches
-    if [ "$returned_state" != "$original_state" ]; then
-        log_fail "State mismatch: expected $original_state, got $returned_state"
+    if [ "$returned_state" != "$STATE" ]; then
+        log_fail "State mismatch: expected $STATE, got $returned_state"
         return 1
     fi
     
@@ -229,7 +264,10 @@ test_callback() {
     
     # Call aggregator callback with the authorization code
     log_info "Calling aggregator callback..."
-    response=$(curl -s -w "\n%{http_code}" "$AGGREGATOR_URL/callback?code=$code&state=$returned_state")
+    # URL-encode parameters for safety
+    encoded_code=$(printf '%s' "$code" | jq -sRr @uri)
+    encoded_state=$(printf '%s' "$returned_state" | jq -sRr @uri)
+    response=$(curl -s -w "\n%{http_code}" --max-time "$CURL_TIMEOUT" "$AGGREGATOR_URL/callback?code=$encoded_code&state=$encoded_state")
     http_code=$(echo "$response" | tail -n1)
     body=$(echo "$response" | head -n-1)
     
@@ -250,43 +288,58 @@ test_callback() {
 
 # Test async token request
 test_token_request() {
-    local provider_name="$1"
-    log_info "Testing async token request for provider: $provider_name"
+    log_info "Testing async token request for provider: $PROVIDER_NAME"
     
-    response=$(curl -s -w "\n%{http_code}" "$AGGREGATOR_URL/$provider_name/test-user")
-    http_code=$(echo "$response" | tail -n1)
-    body=$(echo "$response" | head -n-1)
+    response=$(curl -s -w "\n%{http_code}\n%{header_location}" --max-time "$CURL_TIMEOUT" "$AGGREGATOR_URL/$PROVIDER_NAME/test-user")
+    http_code=$(echo "$response" | head -n1)
+    location=$(echo "$response" | head -n2 | tail -n1)
+    body=$(echo "$response" | tail -n+3)
     
     if [ "$http_code" = "202" ]; then
-        request_id=$(echo "$body" | jq -r '.request_id // empty')
+        REQUEST_ID=$(echo "$body" | jq -r '.request_id // empty')
         
-        if [ -n "$request_id" ]; then
-            log_pass "Token request accepted, request_id: $request_id"
-            echo "$request_id"
+        if [ -n "$REQUEST_ID" ]; then
+            # Validate Location header points to expected polling endpoint
+            expected_location="/requests/$REQUEST_ID"
+            if [ "$location" != "$expected_location" ]; then
+                log_fail "Location header mismatch: expected $expected_location, got $location"
+                REQUEST_ID=""
+                return 1
+            fi
+            log_pass "Token request accepted, request_id: $REQUEST_ID"
         else
             log_fail "Token request response missing request_id: $body"
+            REQUEST_ID=""
             return 1
         fi
     else
         log_fail "Token request failed (HTTP $http_code): $body"
+        REQUEST_ID=""
         return 1
     fi
 }
 
 # Poll request status
 poll_request_status() {
-    local request_id="$1"
-    log_info "Polling request status for request_id: $request_id (timeout: ${POLL_TIMEOUT}s)..."
+    log_info "Polling request status for request_id: $REQUEST_ID (timeout: ${POLL_TIMEOUT}s)..."
     
     elapsed=0
     while [ $elapsed -lt $POLL_TIMEOUT ]; do
-        response=$(curl -s "$AGGREGATOR_URL/requests/$request_id")
-        status=$(echo "$response" | jq -r '.status // empty')
+        response=$(curl -s -w "\n%{http_code}" --max-time "$CURL_TIMEOUT" "$AGGREGATOR_URL/requests/$REQUEST_ID")
+        http_code=$(echo "$response" | tail -n1)
+        body=$(echo "$response" | head -n-1)
+        
+        if [ "$http_code" != "200" ]; then
+            log_fail "Poll request returned HTTP $http_code"
+            return 1
+        fi
+        
+        status=$(echo "$body" | jq -r '.status // empty')
         
         if [ "$status" = "succeeded" ] || [ "$status" = "failed" ]; then
             if [ "$status" = "succeeded" ]; then
                 # Verify token is present but don't print it
-                has_token=$(echo "$response" | jq -r '.access_token // empty')
+                has_token=$(echo "$body" | jq -r '.access_token // empty')
                 if [ -n "$has_token" ]; then
                     log_pass "Request succeeded, token received (redacted)"
                 else
@@ -294,7 +347,7 @@ poll_request_status() {
                     return 1
                 fi
             else
-                error=$(echo "$response" | jq -r '.error // empty')
+                error=$(echo "$body" | jq -r '.error // empty')
                 log_fail "Request failed with error: $error"
                 return 1
             fi
@@ -316,10 +369,10 @@ main() {
     echo -e "${BLUE}========================================${NC}"
     echo ""
     
-    check_tools
-    check_reachability
-    test_healthz
-    test_readyz
+    check_tools || { print_summary; exit 1; }
+    check_reachability || { print_summary; exit 1; }
+    test_healthz || { print_summary; exit 1; }
+    test_readyz || { print_summary; exit 1; }
     
     # If readyz fails, we can't proceed with integration tests
     if [ $TESTS_FAILED -gt 0 ]; then
@@ -333,44 +386,19 @@ main() {
     echo ""
     
     # Provider registration
-    provider_name=$(test_provider_registration)
-    if [ $? -ne 0 ]; then
-        print_summary
-        exit 1
-    fi
+    test_provider_registration || { print_summary; exit 1; }
     
     # OAuth connect
-    connect_result=$(test_oauth_connect "$provider_name")
-    if [ $? -ne 0 ]; then
-        print_summary
-        exit 1
-    fi
-    
-    # Parse auth_url and state from connect result
-    auth_url=$(echo "$connect_result" | awk '{print $1}')
-    state=$(echo "$connect_result" | awk '{print $2}')
+    test_oauth_connect || { print_summary; exit 1; }
     
     # OAuth callback
-    test_callback "$provider_name" "$auth_url" "$state"
-    if [ $? -ne 0 ]; then
-        log_warn "Callback test failed - skipping token request test"
-        print_summary
-        exit 1
-    fi
+    test_callback || { log_warn "Callback test failed - skipping token request test"; print_summary; exit 1; }
     
     # Token request
-    request_id=$(test_token_request "$provider_name")
-    if [ $? -ne 0 ]; then
-        print_summary
-        exit 1
-    fi
+    test_token_request || { print_summary; exit 1; }
     
     # Poll request status
-    poll_request_status "$request_id"
-    if [ $? -ne 0 ]; then
-        print_summary
-        exit 1
-    fi
+    poll_request_status || { print_summary; exit 1; }
     
     print_summary
 }
