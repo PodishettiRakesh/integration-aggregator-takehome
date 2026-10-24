@@ -19,7 +19,7 @@ todos:
     status: pending
   - id: tests
     content: Add unit and integration tests for success, failure, replay, leakage
-    status: pending
+    status: completed
   - id: delivery
     content: Add Docker, Helm chart, Makefile up/down, mock OIDC, smoke script
     status: pending
