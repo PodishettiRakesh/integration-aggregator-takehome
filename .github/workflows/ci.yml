@@ -145,7 +145,7 @@ jobs:
       - name: Configure oauthapp plugin
         run: |
           kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=openbao -n openbao --timeout=120s
-          kubectl exec -n openbao deployment/openbao -- sh -c '
+          kubectl exec -n openbao pod/openbao-0 -- sh -c '
             cd /tmp && \
             curl -L -o oauthapp.zip https://github.com/openbao/openbao-plugin-secrets-oauthapp/releases/download/v3.4.1/openbao-plugin-secrets-oauthapp_v3.4.1_linux_amd64.zip && \
             unzip -o oauthapp.zip && \
@@ -153,11 +153,11 @@ jobs:
             chmod +x /vault/plugins/oauthapp && \
             rm -f oauthapp.zip
           '
-          SHA256=$(kubectl exec -n openbao deployment/openbao -- sha256sum /vault/plugins/oauthapp | awk '{print $1}')
-          kubectl exec -n openbao deployment/openbao -- vault plugin register -sha256="$SHA256" secret oauthapp
-          kubectl exec -n openbao deployment/openbao -- vault secrets enable -path=oauth2 oauthapp || true
-          kubectl exec -n openbao deployment/openbao -- sh -c 'echo "path \"oauth2/*\" { capabilities = [\"create\", \"read\", \"update\", \"delete\", \"list\"] }" | vault policy write aggregator -'
-          AGGREGATOR_TOKEN=$(kubectl exec -n openbao deployment/openbao -- vault token create -policy=aggregator -format=json -ttl=24h | jq -r '.auth.client_token')
+          SHA256=$(kubectl exec -n openbao pod/openbao-0 -- sha256sum /vault/plugins/oauthapp | awk '{print $1}')
+          kubectl exec -n openbao pod/openbao-0 -- vault plugin register -sha256="$SHA256" secret oauthapp
+          kubectl exec -n openbao pod/openbao-0 -- vault secrets enable -path=oauth2 oauthapp || true
+          kubectl exec -n openbao pod/openbao-0 -- sh -c 'echo "path \"oauth2/*\" { capabilities = [\"create\", \"read\", \"update\", \"delete\", \"list\"] }" | vault policy write aggregator -'
+          AGGREGATOR_TOKEN=$(kubectl exec -n openbao pod/openbao-0 -- vault token create -policy=aggregator -format=json -ttl=24h | jq -r '.auth.client_token')
           kubectl create namespace aggregator --dry-run=client -o yaml | kubectl apply -f -
           kubectl create secret generic aggregator-openbao -n aggregator --from-literal=OPENBAO_TOKEN="$AGGREGATOR_TOKEN" --dry-run=client -o yaml | kubectl apply -f -
 
