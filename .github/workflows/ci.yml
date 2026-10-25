@@ -140,6 +140,11 @@ jobs:
             --set server.dev.enabled=true \
             --set server.dev.rootToken="root" \
             --set ui.enabled=true \
+            --set server.standalone.volumes[0].name=plugins \
+            --set server.standalone.volumes[0].emptyDir.medium="" \
+            --set server.standalone.volumeMounts[0].name=plugins \
+            --set server.standalone.volumeMounts[0].mountPath=/vault/plugins \
+            --set server.standalone.config='plugin_directory="/vault/plugins"' \
             --wait
 
       - name: Configure oauthapp plugin
