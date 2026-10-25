@@ -147,31 +147,32 @@ jobs:
           echo "Waiting for OpenBao pod to be ready..."
           kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=openbao -n openbao --timeout=120s
           
-          echo "Checking for required tools in OpenBao pod..."
-          kubectl exec -n openbao pod/openbao-0 -- sh -c 'which curl unzip sha256sum vault || exit 1'
-          
-          echo "Verifying /vault/plugins directory exists..."
+          echo "Verifying /vault/plugins directory exists in OpenBao pod..."
           kubectl exec -n openbao pod/openbao-0 -- sh -c 'ls -d /vault/plugins || exit 1'
           
-          echo "Downloading oauthapp plugin v3.4.1..."
-          kubectl exec -n openbao pod/openbao-0 -- sh -c '
-            cd /tmp && \
-            curl -L --max-time 300 --retry 3 -o oauthapp.zip https://github.com/openbao/openbao-plugin-secrets-oauthapp/releases/download/v3.4.1/openbao-plugin-secrets-oauthapp_v3.4.1_linux_amd64.zip && \
-            unzip -o oauthapp.zip && \
-            mv openbao-plugin-secrets-oauthapp /vault/plugins/oauthapp && \
-            chmod +x /vault/plugins/oauthapp && \
-            rm -f oauthapp.zip && \
-            ls -l /vault/plugins/oauthapp
-          '
+          echo "Downloading oauthapp plugin v3.4.1 on runner..."
+          curl -L --max-time 300 --retry 3 -o /tmp/oauthapp.zip https://github.com/openbao/openbao-plugin-secrets-oauthapp/releases/download/v3.4.1/openbao-plugin-secrets-oauthapp_v3.4.1_linux_amd64.zip
           
-          echo "Calculating plugin SHA256..."
-          SHA256=$(kubectl exec -n openbao pod/openbao-0 -- sha256sum /vault/plugins/oauthapp | awk '{print $1}')
+          echo "Extracting plugin on runner..."
+          unzip -o /tmp/oauthapp.zip -d /tmp
+          
+          echo "Calculating plugin SHA256 on runner..."
+          SHA256=$(sha256sum /tmp/openbao-plugin-secrets-oauthapp | awk '{print $1}')
           echo "Plugin SHA256: $SHA256"
           
           if [ -z "$SHA256" ]; then
             echo "Error: Failed to calculate SHA256"
             exit 1
           fi
+          
+          echo "Transferring plugin binary to OpenBao pod..."
+          kubectl cp /tmp/openbao-plugin-secrets-oauthapp openbao/openbao-0:/vault/plugins/oauthapp
+          
+          echo "Setting executable permissions on plugin..."
+          kubectl exec -n openbao pod/openbao-0 -- chmod +x /vault/plugins/oauthapp
+          
+          echo "Verifying plugin file in pod..."
+          kubectl exec -n openbao pod/openbao-0 -- ls -l /vault/plugins/oauthapp
           
           echo "Registering oauthapp plugin..."
           kubectl exec -n openbao pod/openbao-0 -- vault plugin register -sha256="$SHA256" secret oauthapp
@@ -209,6 +210,9 @@ jobs:
           
           echo "Verifying secret was created..."
           kubectl get secret aggregator-openbao -n aggregator
+          
+          echo "Cleaning up temporary files on runner..."
+          rm -f /tmp/oauthapp.zip /tmp/openbao-plugin-secrets-oauthapp
 
       - name: Build and load Docker image
         run: |
