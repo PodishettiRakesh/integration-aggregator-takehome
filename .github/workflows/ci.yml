@@ -54,11 +54,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set lowercase repository
+        id: repo
+        run: |
+          echo "lowercase=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ steps.repo.outputs.lowercase }}
           tags: |
             type=ref,event=branch
             type=sha,prefix={{branch}}-
@@ -90,7 +95,7 @@ jobs:
       - name: Push Helm chart to GHCR
         run: |
           CHART_FILE=$(ls /tmp/aggregator-*.tgz)
-          helm push ${CHART_FILE} oci://ghcr.io/${{ github.repository }}
+          helm push ${CHART_FILE} oci://ghcr.io/${{ steps.repo.outputs.lowercase }}
 
   integration-test:
     name: Integration Test on Minikube
@@ -116,7 +121,7 @@ jobs:
         uses: medyagh/setup-minikube@latest
         with:
           driver: docker
-          kubernetes-version: v1.29.0
+          kubernetes-version: v1.30.0
 
       - name: Verify Minikube status
         run: |
