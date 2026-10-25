@@ -144,22 +144,71 @@ jobs:
 
       - name: Configure oauthapp plugin
         run: |
+          echo "Waiting for OpenBao pod to be ready..."
           kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=openbao -n openbao --timeout=120s
+          
+          echo "Checking for required tools in OpenBao pod..."
+          kubectl exec -n openbao pod/openbao-0 -- sh -c 'which curl unzip sha256sum vault || exit 1'
+          
+          echo "Verifying /vault/plugins directory exists..."
+          kubectl exec -n openbao pod/openbao-0 -- sh -c 'ls -d /vault/plugins || exit 1'
+          
+          echo "Downloading oauthapp plugin v3.4.1..."
           kubectl exec -n openbao pod/openbao-0 -- sh -c '
             cd /tmp && \
-            curl -L -o oauthapp.zip https://github.com/openbao/openbao-plugin-secrets-oauthapp/releases/download/v3.4.1/openbao-plugin-secrets-oauthapp_v3.4.1_linux_amd64.zip && \
+            curl -L --max-time 300 --retry 3 -o oauthapp.zip https://github.com/openbao/openbao-plugin-secrets-oauthapp/releases/download/v3.4.1/openbao-plugin-secrets-oauthapp_v3.4.1_linux_amd64.zip && \
             unzip -o oauthapp.zip && \
             mv openbao-plugin-secrets-oauthapp /vault/plugins/oauthapp && \
             chmod +x /vault/plugins/oauthapp && \
-            rm -f oauthapp.zip
+            rm -f oauthapp.zip && \
+            ls -l /vault/plugins/oauthapp
           '
+          
+          echo "Calculating plugin SHA256..."
           SHA256=$(kubectl exec -n openbao pod/openbao-0 -- sha256sum /vault/plugins/oauthapp | awk '{print $1}')
+          echo "Plugin SHA256: $SHA256"
+          
+          if [ -z "$SHA256" ]; then
+            echo "Error: Failed to calculate SHA256"
+            exit 1
+          fi
+          
+          echo "Registering oauthapp plugin..."
           kubectl exec -n openbao pod/openbao-0 -- vault plugin register -sha256="$SHA256" secret oauthapp
-          kubectl exec -n openbao pod/openbao-0 -- vault secrets enable -path=oauth2 oauthapp || true
-          kubectl exec -n openbao pod/openbao-0 -- sh -c 'echo "path \"oauth2/*\" { capabilities = [\"create\", \"read\", \"update\", \"delete\", \"list\"] }" | vault policy write aggregator -'
+          
+          echo "Checking if oauth2 secrets engine is already enabled..."
+          if kubectl exec -n openbao pod/openbao-0 -- vault secrets list -format=json | jq -e '.["oauth2/"]' > /dev/null 2>&1; then
+            echo "oauth2 secrets engine already enabled"
+          else
+            echo "Enabling oauth2 secrets engine..."
+            kubectl exec -n openbao pod/openbao-0 -- vault secrets enable -path=oauth2 oauthapp
+          fi
+          
+          echo "Writing aggregator policy..."
+          POLICY_BASE64=$(echo 'path "oauth2/*" { capabilities = ["create", "read", "update", "delete", "list"] }' | base64 -w 0)
+          kubectl exec -n openbao pod/openbao-0 -- sh -c "echo '$POLICY_BASE64' | base64 -d | vault policy write aggregator -"
+          
+          echo "Verifying policy was created..."
+          kubectl exec -n openbao pod/openbao-0 -- vault policy read aggregator
+          
+          echo "Creating aggregator token with 24h TTL..."
           AGGREGATOR_TOKEN=$(kubectl exec -n openbao pod/openbao-0 -- vault token create -policy=aggregator -format=json -ttl=24h | jq -r '.auth.client_token')
+          
+          if [ -z "$AGGREGATOR_TOKEN" ]; then
+            echo "Error: Failed to create aggregator token"
+            exit 1
+          fi
+          
+          echo "Token created successfully (length: ${#AGGREGATOR_TOKEN})"
+          
+          echo "Creating aggregator namespace..."
           kubectl create namespace aggregator --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "Creating aggregator-openbao secret..."
           kubectl create secret generic aggregator-openbao -n aggregator --from-literal=OPENBAO_TOKEN="$AGGREGATOR_TOKEN" --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "Verifying secret was created..."
+          kubectl get secret aggregator-openbao -n aggregator
 
       - name: Build and load Docker image
         run: |
