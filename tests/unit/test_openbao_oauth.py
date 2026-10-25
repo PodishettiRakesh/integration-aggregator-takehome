@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Callable
 
 import httpx
@@ -7,7 +8,7 @@ import pytest
 from app.config import Settings
 from app.core.errors import OpenBaoError, OpenBaoNotFoundError
 from app.integrations.http_client import HttpClient
-from app.integrations.openbao_oauth import OpenBaoOAuth
+from app.integrations.openbao_oauth import OpenBaoOAuth, vault_data
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -169,3 +170,30 @@ async def test_read_creds_error_does_not_leak_token() -> None:
         await client.read_creds("github_alice")
     await client.aclose()
     assert "tok-live" not in str(exc_info.value)
+
+
+def test_vault_data_invalid_json_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
+    response = httpx.Response(200, text="not json")
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(OpenBaoError):
+            vault_data(response)
+
+    assert any("OpenBao returned invalid JSON" in record.message for record in caplog.records)
+
+
+def test_vault_data_non_dict_payload_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
+    response = httpx.Response(200, json=["not", "a", "dict"])
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(OpenBaoError):
+            vault_data(response)
+
+    assert any("OpenBao returned non-dict payload" in record.message for record in caplog.records)
+
+
+def test_vault_data_falls_back_to_payload_when_data_field_missing() -> None:
+    # When payload is a dict but has no "data" field, it returns the payload itself
+    response = httpx.Response(200, json={"not_data": "value"})
+    result = vault_data(response)
+    assert result == {"not_data": "value"}

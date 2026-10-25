@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -9,6 +10,8 @@ from app.config import Settings
 from app.core.errors import OpenBaoError
 from app.integrations.http_client import HttpClient, raise_for_openbao_status
 from app.models.tokens import TokenPayload
+
+logger = logging.getLogger(__name__)
 
 
 class OpenBaoOAuthClient(Protocol):
@@ -151,10 +154,13 @@ def vault_data(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
     except ValueError as exc:
+        logger.warning("OpenBao returned invalid JSON", exc_info=True)
         raise OpenBaoError() from exc
     if not isinstance(payload, dict):
+        logger.warning("OpenBao returned non-dict payload")
         raise OpenBaoError()
     data = payload.get("data", payload)
     if not isinstance(data, dict):
+        logger.warning("OpenBao payload missing data field")
         raise OpenBaoError()
     return data

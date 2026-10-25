@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 
 from app.core.errors import OpenBaoError, OpenBaoUnavailableError
+from app.core.logging import redact_value
+
+logger = logging.getLogger(__name__)
 
 
 class HttpClient:
@@ -38,8 +42,21 @@ class HttpClient:
         try:
             return await self._client.request(method, path, json=json, params=params)
         except httpx.TimeoutException as exc:
+            logger.warning(
+                "OpenBao request timed out method=%s path=%s",
+                method,
+                path,
+                exc_info=True,
+            )
             raise OpenBaoUnavailableError("OpenBao request timed out") from exc
         except httpx.HTTPError as exc:
+            logger.warning(
+                "OpenBao request failed method=%s path=%s error=%s",
+                method,
+                path,
+                type(exc).__name__,
+                exc_info=True,
+            )
             raise OpenBaoUnavailableError("OpenBao is unreachable") from exc
 
     async def get(
@@ -57,10 +74,50 @@ class HttpClient:
 def raise_for_openbao_status(response: httpx.Response) -> None:
     if response.is_success:
         return
-    if response.status_code == 404:
+
+    status_code = response.status_code
+    body_preview = _safe_body_preview(response)
+
+    if status_code == 404:
         from app.core.errors import OpenBaoNotFoundError
 
+        logger.warning(
+            "OpenBao resource not found status=%s body_preview=%s",
+            status_code,
+            body_preview,
+        )
         raise OpenBaoNotFoundError()
-    if response.status_code in {429, 503}:
+
+    if status_code in {429, 503}:
+        logger.warning(
+            "OpenBao unavailable status=%s body_preview=%s",
+            status_code,
+            body_preview,
+        )
         raise OpenBaoUnavailableError()
+
+    logger.error(
+        "OpenBao request failed status=%s body_preview=%s",
+        status_code,
+        body_preview,
+    )
     raise OpenBaoError()
+
+
+def _safe_body_preview(response: httpx.Response, max_length: int = 200) -> str:
+    """Extract a safely sanitized preview of the response body."""
+    try:
+        content = response.text
+    except Exception:
+        return "[unreadable]"
+
+    if not content:
+        return "[empty]"
+
+    sanitized = redact_value(content)
+    if isinstance(sanitized, str):
+        truncated = sanitized[:max_length]
+        if len(sanitized) > max_length:
+            truncated += "..."
+        return truncated
+    return str(sanitized)[:max_length]
