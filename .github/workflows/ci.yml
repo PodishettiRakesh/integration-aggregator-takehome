@@ -277,60 +277,60 @@ jobs:
           kubectl create namespace aggregator --dry-run=client -o yaml | kubectl apply -f -
 
           kubectl apply -n aggregator -f - <<EOF
-apiVersion: v1
-kind: Service
-metadata:
-  name: mock-oauth
-  labels:
-    app: mock-oauth
-spec:
-  ports:
-    - port: 8080
-      targetPort: 8080
-  selector:
-    app: mock-oauth
-EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: mock-oauth
+            labels:
+              app: mock-oauth
+          spec:
+            ports:
+              - port: 8080
+                targetPort: 8080
+            selector:
+              app: mock-oauth
+          EOF
 
           kubectl apply -n aggregator -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mock-oauth
-  labels:
-    app: mock-oauth
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mock-oauth
-  template:
-    metadata:
-      labels:
-        app: mock-oauth
-    spec:
-      containers:
-        - name: mock-oauth
-          image: ghcr.io/navikt/mock-oauth2-server:6.1.3
-          ports:
-            - containerPort: 8080
-          env:
-            - name: SERVER_PORT
-              value: "8080"
-            - name: JSON_CONFIG
-              value: '{"interactiveLogin":false,"tokenCallbacks":[{"issuerId":"default","requestMappings":[{"requestParam":"code","match":"*","claims":{"sub":"test-user"}}]}]}'
-          livenessProbe:
-            httpGet:
-              path: /isalive
-              port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /isalive
-              port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 10
-EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: mock-oauth
+            labels:
+              app: mock-oauth
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: mock-oauth
+            template:
+              metadata:
+                labels:
+                  app: mock-oauth
+              spec:
+                containers:
+                  - name: mock-oauth
+                    image: ghcr.io/navikt/mock-oauth2-server:6.1.3
+                    ports:
+                      - containerPort: 8080
+                    env:
+                      - name: SERVER_PORT
+                        value: "8080"
+                      - name: JSON_CONFIG
+                        value: '{"interactiveLogin":false,"tokenCallbacks":[{"issuerId":"default","requestMappings":[{"requestParam":"code","match":"*","claims":{"sub":"test-user"}}]}]}'
+                    livenessProbe:
+                      httpGet:
+                        path: /isalive
+                        port: 8080
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /isalive
+                        port: 8080
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+          EOF
 
           kubectl wait --for=condition=available deployment/mock-oauth -n aggregator --timeout=120s
 
