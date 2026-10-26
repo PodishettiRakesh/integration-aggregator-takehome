@@ -265,6 +265,81 @@ Invoke-RestMethod -Uri "https://api.github.com/user" `
 6. **Poll status**: `GET /requests/{id}` until status is `succeeded` or `failed`
 7. **Use token**: Access token returned in successful response
 
+## GitHub OAuth End-to-End Test
+
+**Provider**: `github-test`
+**User**: `test-user`
+**Provider type**: Real GitHub OAuth app
+**GitHub account**: App owner's account
+
+### 1. Connect
+
+**Endpoint**: `POST /providers/github-test/users/test-user/connect`
+
+**Observed result**: The API returned a GitHub authorization URL.
+
+The URL is intentionally omitted because it may contain sensitive OAuth state and other query parameters.
+
+### 2. OAuth Callback
+
+**Observed response**:
+```json
+{
+  "status": "connected",
+  "provider": "github-test",
+  "user_id": "test-user"
+}
+```
+
+### 3. Submit an Asynchronous Request
+
+**Endpoint**: `GET /github-test/test-user`
+
+**Observed response**:
+```json
+{
+  "request_id": "jp368KkFgBZrbK5_NEBgGQ"
+}
+```
+
+### 4. Check Request Status
+
+**Endpoint**: `GET /requests/jp368KkFgBZrbK5_NEBgGQ`
+
+**Observed result**:
+```json
+{
+  "request_id": "jp368KkFgBZrbK5_NEBgGQ",
+  "status": "succeeded",
+  "token_type": "Bearer",
+  "expire_time": "2026-10-26T23:55:34.450936657Z"
+}
+```
+
+The access-token value is intentionally omitted.
+
+### 5. Verify the Token Against GitHub
+
+**Status**: Manual verification approach confirmed; GitHub API verification pending.
+
+The aggregator's connect, callback, and asynchronous request flows returned the expected responses. Token verification will be performed directly against GitHub's API rather than by adding another endpoint to the FastAPI server, as this endpoint is not part of the required API specification.
+
+**Verification procedure**:
+- Use the access token obtained through the existing OAuth flow and stored through OpenBao.
+- Call `GET https://api.github.com/user` with the token in the `Authorization: Bearer <token>` header.
+- Confirm that GitHub returns `200 OK` and the expected authenticated GitHub account.
+- Record the HTTP status and a sanitized response, excluding the access token and other sensitive values.
+
+No additional FastAPI endpoint is required for this manual verification.
+
+### 6. Current Conclusion
+
+The observed results demonstrate that the aggregator's connect/callback and asynchronous request flows returned the expected responses.
+
+The verification approach is defined: validate the token directly against GitHub's authenticated-user endpoint using the token obtained through the existing integration. Full end-to-end OAuth verification will be considered complete once GitHub returns `200 OK` and the returned account matches the expected GitHub account.
+
+The access token and other sensitive OAuth values are excluded from the committed evidence.
+
 ## Security Notes
 
 - **State validation**: The service validates the state parameter to prevent CSRF attacks
@@ -273,6 +348,9 @@ Invoke-RestMethod -Uri "https://api.github.com/user" `
 - **Secret storage**: Client secrets are stored in OpenBao, never in the application
 - **Token storage**: Access tokens are stored in OpenBao, the service only retrieves them on demand
 - **No logging**: Tokens, secrets, and authorization codes are never logged
+- **Never commit GitHub client secrets, access tokens, authorization codes, or OAuth state values**
+- **Do not include complete authorization URLs if they expose sensitive values**
+- **Keep evidence limited to sanitized requests, responses, status codes, and request IDs**
 
 ## Troubleshooting
 
