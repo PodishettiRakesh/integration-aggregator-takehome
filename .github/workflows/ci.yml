@@ -378,42 +378,150 @@ jobs:
         run: |
           python3 << 'EOF'
           import json
-          from datetime import datetime
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from math import ceil
 
-          with open('/tmp/perf-results.json', 'r') as f:
-              data = [json.loads(line) for line in f]
+          INPUT_FILE = "/tmp/perf-results.json"
+          OUTPUT_FILE = "/tmp/perf-report.md"
 
           metrics = {}
-          for item in data:
-              if item.get('type') == 'Point' and 'data' in item:
-                  metric_name = item['metric'].get('name', '')
-                  if metric_name:
-                      if metric_name not in metrics:
-                          metrics[metric_name] = []
-                      if 'value' in item['data']:
-                          metrics[metric_name].append(item['data']['value'])
+          request_timestamps = []
+          parse_errors = 0
 
-          report = []
-          report.append("# Performance Test Report\n")
-          report.append(f"Generated: {datetime.utcnow().isoformat()}\n\n")
-          report.append("## Token Retrieval Endpoint\n\n")
+          # Read the k6 JSON output.
+          with open(INPUT_FILE, "r", encoding="utf-8") as f:
+              for line_number, line in enumerate(f, start=1):
+                  if not line.strip():
+                      continue
+
+                  try:
+                      item = json.loads(line)
+                  except json.JSONDecodeError:
+                      parse_errors += 1
+                      continue
+
+                  if not isinstance(item, dict) or item.get("type") != "Point":
+                      continue
+
+                  # k6 commonly represents "metric" as a string, such as
+                  # "http_req_duration". Also support a dictionary representation.
+                  metric = item.get("metric")
+
+                  if isinstance(metric, str):
+                      metric_name = metric
+                  elif isinstance(metric, dict):
+                      metric_name = metric.get("name", "")
+                  else:
+                      continue
+
+                  point_data = item.get("data")
+                  if not isinstance(point_data, dict):
+                      continue
+
+                  value = point_data.get("value")
+                  if isinstance(value, (int, float)):
+                      metrics.setdefault(metric_name, []).append(value)
+
+                  # Capture timestamps of HTTP requests for throughput estimation.
+                  if metric_name == "http_reqs":
+                      timestamp = point_data.get("time")
+                      if isinstance(timestamp, str):
+                          try:
+                              parsed_time = datetime.fromisoformat(
+                                  timestamp.replace("Z", "+00:00")
+                              )
+                              request_timestamps.append(parsed_time)
+                          except ValueError:
+                              pass
+
+
+          def percentile(values, p):
+              """Calculate a percentile using the nearest-rank method."""
+              if not values:
+                  return None
+
+              ordered = sorted(values)
+              index = max(0, ceil(p * len(ordered)) - 1)
+              return ordered[index]
+
+
+          report = [
+              "# Performance Test Report\n\n",
+              f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n",
+              "## Token Retrieval Performance\n\n",
+          ]
+
+          # Latency: k6 reports http_req_duration in milliseconds already.
+          durations = metrics.get("http_req_duration", [])
+
           report.append("### Latency\n\n")
 
-          if 'http_req_duration' in metrics:
-              durations = sorted(metrics['http_req_duration'])
-              p50 = durations[int(len(durations) * 0.5)] * 1000
-              p95 = durations[int(len(durations) * 0.95)] * 1000
-              report.append(f"- p50: {p50:.2f} ms\n")
-              report.append(f"- p95: {p95:.2f} ms\n\n")
+          if durations:
+              report.append(f"- Samples: {len(durations)}\n")
+              report.append(f"- Average: {sum(durations) / len(durations):.2f} ms\n")
+              report.append(f"- p50: {percentile(durations, 0.50):.2f} ms\n")
+              report.append(f"- p95: {percentile(durations, 0.95):.2f} ms\n")
+              report.append(f"- Maximum: {max(durations):.2f} ms\n\n")
+          else:
+              report.append("- No HTTP request duration samples were found.\n\n")
 
+          # Throughput
           report.append("### Throughput\n\n")
-          if 'http_reqs' in metrics:
-              total_reqs = sum(metrics['http_reqs'])
-              report.append(f"- Total requests: {total_reqs}\n")
-              report.append(f"- Requests per second: {total_reqs / 30:.2f}\n\n")
 
-          with open('/tmp/perf-report.md', 'w') as f:
-              f.writelines(report)
+          request_points = metrics.get("http_reqs", [])
+          total_requests = sum(request_points)
+
+          report.append(f"- Total HTTP requests: {total_requests:.0f}\n")
+
+          if len(request_timestamps) >= 2:
+              elapsed_seconds = (
+                  max(request_timestamps) - min(request_timestamps)
+              ).total_seconds()
+
+              if elapsed_seconds > 0:
+                  report.append(
+                      f"- Approximate throughput: "
+                      f"{total_requests / elapsed_seconds:.2f} requests/second\n\n"
+                  )
+              else:
+                  report.append(
+                      "- Throughput unavailable: request timestamps have no measurable span.\n\n"
+                  )
+          else:
+              report.append(
+                  "- Throughput unavailable: insufficient request timestamps.\n\n"
+              )
+
+          # HTTP failures
+          failed_requests = metrics.get("http_req_failed", [])
+
+          report.append("### HTTP Reliability\n\n")
+
+          if failed_requests:
+              failed_count = sum(failed_requests)
+              report.append(f"- Failed-request rate: {failed_count / len(failed_requests) * 100:.2f}%\n")
+              report.append(f"- Failure samples: {len(failed_requests)}\n\n")
+          else:
+              report.append("- No HTTP failure-rate samples were found.\n\n")
+
+          if parse_errors:
+              report.append("### Data Quality\n\n")
+              report.append(f"- Invalid JSON lines skipped: {parse_errors}\n\n")
+
+          if not metrics:
+              report.append(
+                  "**WARNING:** No k6 metric points were found. "
+                  "Check whether the performance test completed successfully.\n"
+              )
+
+          Path(OUTPUT_FILE).write_text("".join(report), encoding="utf-8")
+
+          print(f"Report written to {OUTPUT_FILE}")
+          print("Metrics found:", ", ".join(sorted(metrics.keys())) or "none")
+          print("HTTP request points:", len(request_points))
+          print("Latency samples:", len(durations))
+          print("Invalid JSON lines skipped:", parse_errors)
           EOF
 
       - name: Upload performance report
