@@ -524,6 +524,8 @@ jobs:
           print("Invalid JSON lines skipped:", parse_errors)
           EOF
 
+          cat /tmp/perf-report.md
+
       - name: Upload performance report
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         uses: actions/upload-artifact@v4
