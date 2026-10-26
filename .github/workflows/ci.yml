@@ -155,18 +155,30 @@ jobs:
 
           echo "Extracting plugin on runner..."
           tar -xf /tmp/oauthapp.tar.xz -C /tmp
-          
-          echo "Verifying extracted binary exists and is executable..."
-          if [ ! -f /tmp/openbao-plugin-secrets-oauthapp ]; then
-            echo "Error: Extracted binary not found"
+
+          echo "Listing archive contents..."
+          tar -tf /tmp/oauthapp.tar.xz
+
+          echo "Identifying plugin binary..."
+          PLUGIN_BINARY=$(tar -tf /tmp/oauthapp.tar.xz | head -1)
+          echo "Plugin binary: $PLUGIN_BINARY"
+
+          if [ -z "$PLUGIN_BINARY" ]; then
+            echo "Error: Failed to identify plugin binary from archive"
             exit 1
           fi
-          chmod +x /tmp/openbao-plugin-secrets-oauthapp
-          
+
+          echo "Verifying extracted binary exists and is executable..."
+          if [ ! -f "/tmp/$PLUGIN_BINARY" ]; then
+            echo "Error: Extracted binary not found at /tmp/$PLUGIN_BINARY"
+            exit 1
+          fi
+          chmod +x "/tmp/$PLUGIN_BINARY"
+
           echo "Calculating plugin SHA256 on runner..."
-          RUNNER_SHA256=$(sha256sum /tmp/openbao-plugin-secrets-oauthapp | awk '{print $1}')
+          RUNNER_SHA256=$(sha256sum "/tmp/$PLUGIN_BINARY" | awk '{print $1}')
           echo "Runner SHA256: $RUNNER_SHA256"
-          
+
           if [ -z "$RUNNER_SHA256" ]; then
             echo "Error: Failed to calculate SHA256 on runner"
             exit 1
@@ -189,21 +201,21 @@ jobs:
           
           echo "=== C. Transferring and verifying plugin binary ==="
           echo "Copying plugin binary to OpenBao pod..."
-          kubectl cp /tmp/openbao-plugin-secrets-oauthapp openbao/openbao-0:/vault/plugins/oauthapp
-          
+          kubectl cp "/tmp/$PLUGIN_BINARY" openbao/openbao-0:/vault/plugins/oauthapp
+
           echo "Setting executable permissions on plugin in pod..."
           kubectl exec -n openbao pod/openbao-0 -- chmod +x /vault/plugins/oauthapp
-          
+
           echo "Verifying plugin file exists in pod..."
           if ! kubectl exec -n openbao pod/openbao-0 -- sh -c 'test -f /vault/plugins/oauthapp'; then
             echo "Error: Plugin file not found in pod after transfer"
             exit 1
           fi
-          
+
           echo "Calculating SHA256 of plugin in pod..."
           POD_SHA256=$(kubectl exec -n openbao pod/openbao-0 -- sha256sum /vault/plugins/oauthapp | awk '{print $1}')
           echo "Pod SHA256: $POD_SHA256"
-          
+
           echo "Comparing checksums..."
           if [ "$RUNNER_SHA256" != "$POD_SHA256" ]; then
             echo "Error: SHA256 mismatch between runner and pod"
@@ -253,7 +265,7 @@ jobs:
           
           echo "=== E. Cleanup ==="
           echo "Cleaning up temporary files on runner..."
-          rm -f /tmp/oauthapp.tar.xz /tmp/openbao-plugin-secrets-oauthapp
+          rm -f /tmp/oauthapp.tar.xz "/tmp/$PLUGIN_BINARY"
 
       - name: Build and load Docker image
         run: |
