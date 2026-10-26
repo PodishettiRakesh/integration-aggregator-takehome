@@ -322,14 +322,14 @@ spec:
             httpGet:
               path: /isalive
               port: 8080
-            initialDelaySeconds: 5
-            periodSeconds: 10
+          initialDelaySeconds: 5
+          periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /isalive
               port: 8080
-            initialDelaySeconds: 5
-            periodSeconds: 10
+          initialDelaySeconds: 5
+          periodSeconds: 10
 EOF
 
           kubectl wait --for=condition=available deployment/mock-oauth -n aggregator --timeout=120s
