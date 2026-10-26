@@ -136,69 +136,104 @@ jobs:
           helm upgrade --install openbao openbao/openbao \
             --namespace openbao \
             --set injector.enabled=false \
-            --set server.standalone.enabled=true \
             --set server.dev.enabled=true \
             --set server.dev.rootToken="root" \
             --set ui.enabled=true \
-            --set server.standalone.volumes[0].name=plugins \
-            --set server.standalone.volumes[0].emptyDir.medium="" \
-            --set server.standalone.volumeMounts[0].name=plugins \
-            --set server.standalone.volumeMounts[0].mountPath=/vault/plugins \
-            --set server.standalone.config='plugin_directory="/vault/plugins"' \
+            --set server.volumes[0].name=plugins \
+            --set server.volumes[0].emptyDir.medium="" \
+            --set server.volumeMounts[0].name=plugins \
+            --set server.volumeMounts[0].mountPath=/vault/plugins \
+            --set server.extraArgs='-dev-plugin-dir=/vault/plugins' \
             --wait
 
       - name: Configure oauthapp plugin
         run: |
-          echo "Waiting for OpenBao pod to be ready..."
-          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=openbao -n openbao --timeout=120s
+          set -e
           
-          echo "Verifying /vault/plugins directory exists in OpenBao pod..."
-          kubectl exec -n openbao pod/openbao-0 -- sh -c 'ls -d /vault/plugins || exit 1'
-          
-          echo "Downloading oauthapp plugin v3.4.1 on runner..."
-          curl -L --max-time 300 --retry 3 -o /tmp/oauthapp.zip https://github.com/openbao/openbao-plugin-secrets-oauthapp/releases/download/v3.4.1/openbao-plugin-secrets-oauthapp_v3.4.1_linux_amd64.zip
-          
+          echo "=== A. Downloading oauthapp plugin v3.4.1 on runner ==="
+          curl -fL --retry 3 -o /tmp/oauthapp.tar.xz https://github.com/openbao/openbao-plugin-secrets-oauthapp/releases/download/v3.4.1/openbao-plugin-secrets-oauthapp-v3.4.1-linux-amd64.tar.xz
+
           echo "Extracting plugin on runner..."
-          unzip -o /tmp/oauthapp.zip -d /tmp
+          tar -xf /tmp/oauthapp.tar.xz -C /tmp
+          
+          echo "Verifying extracted binary exists and is executable..."
+          if [ ! -f /tmp/openbao-plugin-secrets-oauthapp ]; then
+            echo "Error: Extracted binary not found"
+            exit 1
+          fi
+          chmod +x /tmp/openbao-plugin-secrets-oauthapp
           
           echo "Calculating plugin SHA256 on runner..."
-          SHA256=$(sha256sum /tmp/openbao-plugin-secrets-oauthapp | awk '{print $1}')
-          echo "Plugin SHA256: $SHA256"
+          RUNNER_SHA256=$(sha256sum /tmp/openbao-plugin-secrets-oauthapp | awk '{print $1}')
+          echo "Runner SHA256: $RUNNER_SHA256"
           
-          if [ -z "$SHA256" ]; then
-            echo "Error: Failed to calculate SHA256"
+          if [ -z "$RUNNER_SHA256" ]; then
+            echo "Error: Failed to calculate SHA256 on runner"
             exit 1
           fi
           
-          echo "Transferring plugin binary to OpenBao pod..."
+          echo "=== B. Verifying OpenBao plugin directory ==="
+          echo "Waiting for OpenBao pod to be ready..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=openbao -n openbao --timeout=120s
+          
+          echo "Checking if /vault/plugins directory exists in OpenBao pod..."
+          if ! kubectl exec -n openbao pod/openbao-0 -- sh -c 'test -d /vault/plugins'; then
+            echo "Error: /vault/plugins directory does not exist in OpenBao pod"
+            echo "The Helm installation must configure the plugin directory mount correctly"
+            echo "Expected: server.standalone.volumeMounts with mountPath=/vault/plugins"
+            exit 1
+          fi
+          
+          echo "Verifying /vault/plugins is a mount point (not a regular directory)..."
+          kubectl exec -n openbao pod/openbao-0 -- sh -c 'mount | grep /vault/plugins || true'
+          
+          echo "=== C. Transferring and verifying plugin binary ==="
+          echo "Copying plugin binary to OpenBao pod..."
           kubectl cp /tmp/openbao-plugin-secrets-oauthapp openbao/openbao-0:/vault/plugins/oauthapp
           
-          echo "Setting executable permissions on plugin..."
+          echo "Setting executable permissions on plugin in pod..."
           kubectl exec -n openbao pod/openbao-0 -- chmod +x /vault/plugins/oauthapp
           
-          echo "Verifying plugin file in pod..."
-          kubectl exec -n openbao pod/openbao-0 -- ls -l /vault/plugins/oauthapp
+          echo "Verifying plugin file exists in pod..."
+          if ! kubectl exec -n openbao pod/openbao-0 -- sh -c 'test -f /vault/plugins/oauthapp'; then
+            echo "Error: Plugin file not found in pod after transfer"
+            exit 1
+          fi
           
-          echo "Registering oauthapp plugin..."
-          kubectl exec -n openbao pod/openbao-0 -- vault plugin register -sha256="$SHA256" secret oauthapp
+          echo "Calculating SHA256 of plugin in pod..."
+          POD_SHA256=$(kubectl exec -n openbao pod/openbao-0 -- sha256sum /vault/plugins/oauthapp | awk '{print $1}')
+          echo "Pod SHA256: $POD_SHA256"
           
+          echo "Comparing checksums..."
+          if [ "$RUNNER_SHA256" != "$POD_SHA256" ]; then
+            echo "Error: SHA256 mismatch between runner and pod"
+            echo "Runner: $RUNNER_SHA256"
+            echo "Pod: $POD_SHA256"
+            exit 1
+          fi
+          echo "Checksums match"
+          
+          echo "=== D. Registering and configuring OpenBao ==="
+          echo "Registering oauthapp plugin with verified checksum..."
+          kubectl exec -n openbao pod/openbao-0 -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault plugin register -sha256="$RUNNER_SHA256" secret oauthapp
+
           echo "Checking if oauth2 secrets engine is already enabled..."
-          if kubectl exec -n openbao pod/openbao-0 -- vault secrets list -format=json | jq -e '.["oauth2/"]' > /dev/null 2>&1; then
+          if kubectl exec -n openbao pod/openbao-0 -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault secrets list -format=json | jq -e '.["oauth2/"]' > /dev/null 2>&1; then
             echo "oauth2 secrets engine already enabled"
           else
             echo "Enabling oauth2 secrets engine..."
-            kubectl exec -n openbao pod/openbao-0 -- vault secrets enable -path=oauth2 oauthapp
+            kubectl exec -n openbao pod/openbao-0 -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault secrets enable -path=oauth2 oauthapp
           fi
-          
+
           echo "Writing aggregator policy..."
           POLICY_BASE64=$(echo 'path "oauth2/*" { capabilities = ["create", "read", "update", "delete", "list"] }' | base64 -w 0)
-          kubectl exec -n openbao pod/openbao-0 -- sh -c "echo '$POLICY_BASE64' | base64 -d | vault policy write aggregator -"
-          
+          kubectl exec -n openbao pod/openbao-0 -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root sh -c "echo '$POLICY_BASE64' | base64 -d | vault policy write aggregator -"
+
           echo "Verifying policy was created..."
-          kubectl exec -n openbao pod/openbao-0 -- vault policy read aggregator
-          
+          kubectl exec -n openbao pod/openbao-0 -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault policy read aggregator
+
           echo "Creating aggregator token with 24h TTL..."
-          AGGREGATOR_TOKEN=$(kubectl exec -n openbao pod/openbao-0 -- vault token create -policy=aggregator -format=json -ttl=24h | jq -r '.auth.client_token')
+          AGGREGATOR_TOKEN=$(kubectl exec -n openbao pod/openbao-0 -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault token create -policy=aggregator -format=json -ttl=24h | jq -r '.auth.client_token')
           
           if [ -z "$AGGREGATOR_TOKEN" ]; then
             echo "Error: Failed to create aggregator token"
@@ -216,8 +251,9 @@ jobs:
           echo "Verifying secret was created..."
           kubectl get secret aggregator-openbao -n aggregator
           
+          echo "=== E. Cleanup ==="
           echo "Cleaning up temporary files on runner..."
-          rm -f /tmp/oauthapp.zip /tmp/openbao-plugin-secrets-oauthapp
+          rm -f /tmp/oauthapp.tar.xz /tmp/openbao-plugin-secrets-oauthapp
 
       - name: Build and load Docker image
         run: |
