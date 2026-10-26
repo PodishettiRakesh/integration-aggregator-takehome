@@ -274,8 +274,6 @@ jobs:
 
       - name: Deploy mock OAuth server
         run: |
-          helm repo add navikt https://navikt.github.io/charts
-          helm repo update
           helm upgrade --install mock-oauth oci://ghcr.io/navikt/mock-oauth2-server \
             --namespace aggregator \
             --set httpPort=8080 \
