@@ -1,6 +1,6 @@
 # Performance Test Report
 
-**Test Date:** [Fill in after running]
+**Test Date:** October 27, 2026
 **Test Duration:** 60 seconds
 **Tool:** k6 v0.54.0
 **Endpoint:** Token retrieval (async flow with polling)
@@ -25,37 +25,39 @@
 
 ## Results
 
+*These are aggregate results from the GitHub Actions performance report generated on October 27, 2026.*
+
 ### Latency
 
 | Metric | Value |
 |--------|-------|
-| p50 latency | [ms - fill from CI artifact] |
-| p95 latency | [ms - fill from CI artifact] |
-| p99 latency | [ms - fill from CI artifact] |
+| Average latency | 1.35 ms |
+| p50 latency | 1.08 ms |
+| p95 latency | 2.33 ms |
+| Maximum latency | 74.87 ms |
 
 ### Throughput
 
 | Metric | Value |
 |--------|-------|
-| Total requests | [fill from CI artifact] |
-| Requests per second | [fill from CI artifact] |
-| Success rate | [% - fill from CI artifact] |
+| Total requests | 1,831 |
+| Requests per second | 30.25 |
 
-### Concurrency Levels
+### Reliability
 
-| Concurrency | Avg Latency (ms) | Throughput (req/s) | Error Rate (%) |
-|-------------|------------------|-------------------|----------------|
-| 10 users | [fill from CI artifact] | [fill from CI artifact] | [fill from CI artifact] |
-| 20 users | [fill from CI artifact] | [fill from CI artifact] | [fill from CI artifact] |
-| 50 users | [fill from CI artifact] | [fill from CI artifact] | [fill from CI artifact] |
+| Metric | Value |
+|--------|-------|
+| Failed-request rate | 0.00% |
+| Failure samples | 0 |
 
 ## Analysis
 
-[Fill in analysis after running the test]
+The performance test completed successfully with zero failures across 1,831 HTTP requests. The failed-request rate was 0.00%, indicating that all token retrieval operations completed without errors during the test run. The p95 latency of 2.33 ms demonstrates that 95% of requests completed within approximately 2.33 milliseconds, which is well below the 5-second threshold configured in the k6 test script. The maximum observed latency of 74.87 ms represents an outlier; the average latency of 1.35 ms and p50 of 1.08 ms show that typical response times are significantly lower.
 
 ## Notes
 
-- Performance test runs in CI after successful integration test
-- Results are uploaded as GitHub Actions artifacts
+- Performance test runs in CI after successful integration test on main branch pushes
+- Results are uploaded as GitHub Actions artifacts as `performance-report`
 - To run locally: `k6 run perf/token_retrieval.js --out json=perf-results.json`
 - Requires deployed environment with mock OAuth server
+- The test simulates token retrieval from pre-stored credentials; it does not exercise the full OAuth consent flow
