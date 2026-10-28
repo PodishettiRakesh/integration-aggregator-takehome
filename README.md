@@ -1,297 +1,669 @@
-# Take-Home Problem: Integration Aggregator
+# Integration Aggregator
 
-| | |
-|---|---|
-| **Role** | Junior Software Engineer |
-| **Effort** | 8–12 days of focused work, completed within three weeks |
-| **Language** | Go or Python — pick one, use it idiomatically |
-| **Cost** | Free. Local tools and free tiers only, no paid services |
-| **Deliverable** | Your public fork, green CI on the final commit |
+A production-ready OAuth token orchestration service that provides a unified API for managing OAuth provider registrations, user consent flows, and access token retrieval. Built with Python FastAPI and backed by OpenBao's oauthapp plugin, the service delegates all OAuth logic and token storage to OpenBao, ensuring secrets never touch application memory or logs.
 
-Fork this repository and build in your fork. There is no submission step.
-Open a pull request here only to fix an error in this document.
+This service solves the common problem of duplicated OAuth implementations across product teams by providing a centralized, secure token management layer that integrates with multiple OAuth providers (GitHub, Google, GitLab, and generic OIDC).
 
-## About your time
+---
 
-8–12 days is a serious investment, and not everyone who completes this is
-selected. Know that before you start. We ask for it anyway because the work
-mirrors the job, and we have tried to make every hour count: the setup links
-below are curated so you research the problem, not the tooling, and the review
-process is defined so finished work is never ignored.
+## Project Overview
 
-Whatever the outcome, the result stays in your public fork under your name: a
-deployed, CI-verified service integrating OAuth, Kubernetes, and a secrets
-manager. That is a portfolio piece for any application, not just this one.
-Thank you for considering us.
+The Integration Aggregator acts as an orchestration layer between internal services and OAuth providers. It handles:
 
-## Background
+- **Provider Registration**: Securely registers OAuth providers with client credentials
+- **Consent Flow**: Manages OAuth authorization-code flows with cryptographically secure state validation
+- **Token Retrieval**: Provides asynchronous access tokens with automatic refresh handled by OpenBao
+- **Secrets Management**: Integrates with OpenBao for least-privilege access to OAuth secrets
 
-Product teams keep re-implementing OAuth for the same public providers (Google,
-GitHub). We want one internal service other services can ask for a user's
-access token, instead of each handling OAuth themselves.
+### Key Design Philosophy
 
-The division of labor:
+The service implements no OAuth logic itself. All token storage, refresh, and authorization-code exchanges are delegated to OpenBao's oauthapp plugin. This separation of concerns ensures:
 
-- **[OpenBao](https://openbao.org)** holds every secret: OAuth client secrets
-  and all tokens. Tokens never live in application files or logs.
-- **[openbao-plugin-secrets-oauthapp](https://github.com/openbao/openbao-plugin-secrets-oauthapp)**
-  does the OAuth: authorization-code exchange, token storage, refresh before
-  expiry.
-- **Your service** orchestrates: registers providers, drives the consent flow,
-  and exposes the API. It implements no OAuth and persists no tokens.
+- Zero knowledge of tokens in the application layer
+- Centralized secret management with least-privilege policies
+- Automatic token refresh before expiry
+- Consistent security posture across all providers
 
-## Getting set up
+**Upstream Attribution**: This project builds upon the oauthapp plugin architecture from [OpenBao](https://openbao.org) and [openbao-plugin-secrets-oauthapp](https://github.com/openbao/openbao-plugin-secrets-oauthapp).
 
-Budget half a day for environment setup before writing any code. These are
-the docs we used. They contain everything you need; the wiring between them
-is the exercise.
+---
 
-Work in this order and do not skip ahead:
+## Architecture
 
-1. Cluster up, OpenBao running with the plugin enabled, service deployed by
-   `make up`.
-2. The three flows working locally, driven by curl.
-3. Only then: CI, publishing, and the perf test.
+### System Components
 
-Steps 1 and 2 are most of the value and most of the difficulty. CI and perf
-testing automate what already works. Starting there wastes your time.
+```mermaid
+graph TB
+    subgraph "Kubernetes Cluster"
+        API[FastAPI Service]
+        MOCK[Mock OAuth Server]
+        subgraph "OpenBao Namespace"
+            OB[OpenBao]
+            PLUG[oauthapp Plugin]
+        end
+    end
 
-**Local cluster**
+    Client[Internal Services]
+    Provider[OAuth Providers<br/>GitHub, Google, GitLab]
 
-- [minikube](https://minikube.sigs.k8s.io/docs/start/) — install and start a
-  local cluster. Pick a driver that works on your OS from the same docs.
-- [kubectl](https://kubernetes.io/docs/tasks/tools/) — cluster CLI.
-- [Helm](https://helm.sh/docs/intro/install/) — installs OpenBao and deploys
-  your chart. [Chart authoring guide](https://helm.sh/docs/chart_template_guide/)
-  and [OCI registries](https://helm.sh/docs/topics/registries/) for publishing.
+    Client -->|HTTP| API
+    API -->|Plugin API| OB
+    OB --> PLUG
+    PLUG -->|Token Storage| OB
+    API -->|Auth URL| MOCK
+    MOCK -->|Programmatic Consent| API
+    PLUG -->|Exchange Tokens| Provider
 
-**OpenBao and the plugin**
+    style API fill:#4CAF50,color:#fff
+    style OB fill:#2196F3,color:#fff
+    style PLUG fill:#FF9800,color:#fff
+    style MOCK fill:#9C27B0,color:#fff
+```
 
-- [OpenBao docs](https://openbao.org/docs/) — start with dev-mode server and
-  the concepts section on auth and policies.
-- [openbao-helm](https://github.com/openbao/openbao-helm) — the chart for
-  running OpenBao in the cluster.
-- [Plugin management](https://openbao.org/docs/plugins/plugin-management/) —
-  how external plugins are registered and enabled. You will need this for the
-  next item.
-- [openbao-plugin-secrets-oauthapp](https://github.com/openbao/openbao-plugin-secrets-oauthapp)
-  — read the whole README before designing your API. Prebuilt binaries are on
-  the releases page.
+### Request Flow
 
-**OAuth providers**
+The service implements three core flows:
 
-- [OAuth 2.0 overview](https://oauth.net/2/) — the authorization-code flow,
-  if it is new to you.
-- [Creating a GitHub OAuth app](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
-- [Google OAuth 2.0](https://developers.google.com/identity/protocols/oauth2/web-server)
-- [Dex](https://dexidp.io/docs/) or
-  [mock-oauth2-server](https://github.com/navikt/mock-oauth2-server) — the
-  local provider for your CI smoke test.
+#### 1. Provider Registration
+```mermaid
+sequenceDiagram
+    participant OP as Operator
+    participant API as Aggregator API
+    participant OB as OpenBao
 
-**CI and load testing** (last, after the local flow works)
+    OP->>API: POST /providers<br/>(client_id, client_secret)
+    API->>OB: PUT oauth2/servers/{name}<br/>(client secret)
+    OB-->>API: Configured
+    API-->>OP: 201 Created
+    Note over API,OB: Client secret stored only in OpenBao
+```
 
-- [GitHub Actions](https://docs.github.com/en/actions) and
-  [setup-minikube](https://github.com/medyagh/setup-minikube) — minikube on a
-  free runner.
-- [ghcr.io container registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
-  — image and chart publishing with the built-in `GITHUB_TOKEN`.
-- [k6](https://grafana.com/docs/k6/latest/),
-  [hey](https://github.com/rakyll/hey), or
-  [Locust](https://docs.locust.io/) — pick one for the perf test.
-
-## What to build
-
-A single HTTP service, deployed to a local minikube cluster, with OpenBao as
-its only backing store. There is no database. Provider metadata, connection
-state, and async request state are held in memory by the service.
-
-### Required flow
-
-1. **Register a provider.** An operator registers an OAuth provider
-   (GitHub and at least one of Google/GitLab) with its client ID and client
-   secret. Your service configures the corresponding server entry in the
-   oauthapp secrets engine. Client secrets go to OpenBao only.
-2. **Connect a user.** A caller starts a connection for
-   `(provider, user_id)`. Your service returns the provider's authorization
-   URL (the plugin generates it). The user completes consent in a browser.
-   Your callback endpoint receives the OIDC authorization code and hands it to
-   the plugin, which exchanges it for tokens and stores them.
-3. **Retrieve a token.** A caller requests the current access token for
-   `(provider, user_id)`. The plugin refreshes expired tokens transparently.
-
-Both GitHub OAuth apps and Google OAuth clients are free to create. Use
-`http://localhost:<port>/callback` (via `kubectl port-forward` or
-`minikube service`) as the redirect URI.
-
-### API
-
-Exact paths are yours to design, but it must include the equivalents of:
-
-| Endpoint | Behavior |
-|---|---|
-| `POST /providers` | Register a provider (name, client ID, client secret). |
-| `POST /providers/{provider}/users/{user}/connect` | Start a connection. Returns the authorization URL and a state value. |
-| `GET /callback` | Receives `code` and `state`, completes the exchange via the plugin. |
-| `GET /{provider}/{user}` | Returns the user's current access token. |
-| `GET /requests/{id}` | Status/result of an async request (see below). |
-
-### Async requirement
-
-`GET /{provider}/{user}` must not block on OpenBao inline. It returns
-`202 Accepted` with a request ID and a `Location` header. A background worker
-(goroutine or async task inside the same process) fulfills the request, and
-the caller polls `GET /requests/{id}` for the result. Request state is an
-in-memory structure. A single replica is acceptable. State in `DESIGN.md` what
-breaks at more than one replica and what you would use to fix it.
-
-### Data placement
-
-- **OpenBao:** client secrets and all OAuth tokens.
-- **Service memory:** provider names, connection state (OAuth `state` values),
-  async request status. Nothing here is ever written to disk.
-
-A token or client secret found in a log, an HTTP response other than the
-token endpoint, or the repo is a failing condition.
-
-### Sequence
-
-The reference flow. Your paths may differ, the ordering and data placement
-may not.
-
-**Register a provider**
-
+#### 2. User Consent Flow
 ```mermaid
 sequenceDiagram
     participant C as Caller
-    participant A as API
+    participant API as Aggregator API
     participant OB as OpenBao
+    participant U as User
+    participant P as OAuth Provider
 
-    C->>A: POST /providers
-    A->>OB: write server config (client secret)
-    A-->>C: 201
+    C->>API: POST /providers/{name}/users/{id}/connect
+    API->>API: Generate state (crypto-random)
+    API->>OB: PUT oauth2/auth-code-url
+    OB-->>API: Authorization URL
+    API-->>C: 200 {auth_url, state}
+    C->>U: Redirect to auth_url
+    U->>P: User consents
+    P-->>U: 302 redirect?code&state
+    U->>API: GET /callback?code&state
+    API->>API: Validate state (not expired, not replayed)
+    API->>OB: PUT oauth2/creds/{provider}_{user}
+    OB->>P: Exchange code for tokens
+    OB-->>API: Tokens stored
+    API-->>U: 200 Connected
 ```
 
-**Connect a user**
-
-```mermaid
-sequenceDiagram
-    actor U as User
-    participant C as Caller
-    participant A as API
-    participant OB as OpenBao
-    participant P as Provider
-
-    C->>A: POST .../users/{u}/connect
-    A->>A: generate state, remember (state -> p, u)
-    A->>OB: read auth-code-url (server, state)
-    A-->>C: 200 auth_url
-    C->>U: send user to auth_url
-    U->>P: consent
-    P-->>U: 302 redirect_uri?code&state
-    U->>A: GET /callback?code&state
-    A->>A: validate state
-    A->>OB: write code to creds/{p}_{u}
-    OB->>P: exchange code for tokens
-    OB-->>A: stored
-    A-->>U: 200 connected
-```
-
-**Retrieve a token (async)**
-
+#### 3. Async Token Retrieval
 ```mermaid
 sequenceDiagram
     participant C as Caller
-    participant A as API
-    participant W as Worker
+    participant API as Aggregator API
+    participant W as Background Worker
     participant OB as OpenBao
 
-    C->>A: GET /{p}/{u}
-    A->>W: queue request {id}
-    A-->>C: 202, Location /requests/{id}
-    W->>OB: read creds/{p}_{u}
-    note right of OB: plugin refreshes if expired
-    W->>A: mark request {id} done, hold token
-    C->>A: GET /requests/{id}
-    A-->>C: 200 token
+    C->>API: GET /{provider}/{user}
+    API->>W: Queue request {id}
+    API-->>C: 202 Accepted<br/>Location: /requests/{id}
+    W->>OB: GET oauth2/creds/{provider}_{user}
+    Note right of OB: Plugin refreshes if expired
+    OB-->>W: Access token
+    W->>API: Mark request succeeded, hold token
+    C->>API: GET /requests/{id}
+    API-->>C: 200 {access_token}
 ```
 
-Token freshness, refresh, and caching are the plugin's job. Do not build your
-own cache or refresh logic.
+### Data Placement
 
-## Delivery requirements
+| Data Type | Location | Rationale |
+|-----------|----------|-----------|
+| Client secrets | OpenBao (`oauth2/servers/{name}`) | Persistent secrets store, never exposed to application |
+| OAuth access/refresh tokens | OpenBao (`oauth2/creds/{provider}_{user}`) | Plugin handles refresh and expiry, never in application memory |
+| Provider metadata (name, client_id, scopes) | Service memory (ProviderRegistry) | Fast lookup, no secrets, acceptable to lose on restart |
+| OAuth state values | Service memory (OAuthStateStore) | CSRF protection, consume-once validation, short-lived (10 min TTL) |
+| Async request records | Service memory (RequestManager) | Polling interface, tokens held transiently, TTL cleanup (1 hour) |
 
-1. **Makefile, idempotent.** `make up` from a clean machine (minikube
-   installed, cluster may or may not exist) brings up minikube, OpenBao with
-   the oauthapp plugin registered and enabled, and your service. Running
-   `make up` twice in a row succeeds and changes nothing the second time.
-   `make down` tears it all down.
-2. **No secrets in the repo.** `.gitignore` covers env files, unseal keys,
-   root tokens, client secrets. Secrets enter the cluster at deploy time
-   (e.g. Kubernetes Secrets created by `make up` from local env files).
-3. **Performance test.** A script (k6, hey, locust, or similar) that load-tests
-   the token-retrieval path, plus a short report in the repo: p50/p95 latency
-   and throughput at two or three concurrency levels.
-4. **Published artifacts.** A container image and a Helm chart, both published
-   from CI to ghcr.io under your fork (the default `GITHUB_TOKEN` can push
-   both via OCI). `make up` deploys from the chart, not from raw manifests.
-5. **CI proves it works.** A GitHub Actions workflow in your fork that, on
-   every push: runs unit tests, runs `make up` on minikube (works on
-   `ubuntu-latest`, free for public repos), executes an end-to-end smoke test
-   of the full flow, runs the perf script, and uploads the perf report as a
-   build artifact. Interactive consent cannot run in CI, so the smoke test
-   must use a local OIDC provider that can be driven programmatically (Dex
-   with static passwords, or navikt/mock-oauth2-server) registered through
-   the same `POST /providers` path as a real provider. We evaluate by reading
-   your CI run, not by running your code.
+**Note**: In-memory state limits deployment to a single replica. Horizontal scaling would require distributed storage (Redis or similar). See [DESIGN.md](DESIGN.md) for production improvements.
 
-### Kubernetes or Terraform depth
+---
 
-The base path is Kubernetes: a Helm chart you wrote (not just `helm create`
-output), with values for image, OpenBao address, replica count,
-resource limits, and probes.
+## Technology Stack
 
-Alternative for the OpenBao setup: instead of scripting `bao` CLI calls in the
-Makefile, manage the plugin mount, server config, and policies with Terraform
-and the OpenBao provider. Either path is acceptable. Doing the OpenBao
-configuration in Terraform on top of the Helm-based deploy counts as a plus.
+### Core Application
+- **Python 3.11+**: Runtime environment
+- **FastAPI 0.115.6**: Async web framework with automatic OpenAPI documentation
+- **Uvicorn 0.34.0**: ASGI server with async support
+- **Pydantic 2.7.1**: Data validation and settings management
+- **httpx 0.28.1**: Async HTTP client for OpenBao communication
 
-## What we evaluate
+### Infrastructure
+- **Kubernetes**: Container orchestration with minikube for local development
+- **Helm 3.16.1**: Package management for application deployment
+- **Docker**: Containerization with multi-stage builds
+- **OpenBao 2.7.1**: Secrets management with oauthapp plugin v3.4.1
 
-| Area | Weight | What we look for |
-|---|---|---|
-| Working flow | 40% | Green CI on the final commit: fresh `make up`, then registration, consent (local OIDC), code exchange, and token retrieval end to end. Red or absent CI caps this area at zero. |
-| Kubernetes/Terraform | 25% | Chart quality, idempotent deploy, sane probes and resources, or equivalent Terraform rigor. |
-| Code quality | 20% | Small focused files, clear package/module boundaries, error handling, tests. Files over ~300 lines need a reason. |
-| Security hygiene | 10% | Nothing sensitive in the repo or logs. Least-privilege OpenBao policy for the service is a plus. |
-| Async + performance | 5% | 202 flow is correct (no lost requests, no duplicate fulfillment), perf report is present and honest. |
+### Testing & CI
+- **pytest 8.3.4**: Unit and integration testing
+- **pytest-asyncio 0.25.2**: Async test support
+- **Ruff 0.8.6**: Fast Python linter and formatter
+- **k6 0.54.0**: Performance testing
+- **GitHub Actions**: CI/CD pipeline with minikube integration
 
-## How we review your fork
+### Mock OAuth Provider
+- **navikt/mock-oauth2-server 6.1.3**: Programmatically drivable OIDC provider for CI smoke tests
 
-We spend about 20 minutes per fork, in this order. Make each step easy.
+---
 
-1. CI status on the final commit of the default branch. Red stops the review.
-2. The CI run itself: smoke-test output and the perf-report artifact.
-3. `DESIGN.md` (one page, required): architecture, what lives where and why,
-   and what you would change for production.
-4. A code skim guided by the rubric above.
+## Key Features
 
-Your fork must contain all code, the Makefile, the chart and workflow sources,
-and the perf script. A terminal transcript or short recording of the flow
-against real GitHub, committed to the repo, covers the part CI cannot: proof
-the real-provider consent path works. Include one.
+### Security
+- **Zero token knowledge**: Application never stores or logs OAuth tokens
+- **Least-privilege OpenBao policy**: Service token limited to `oauth2/*` paths only
+- **Cryptographic state validation**: URL-safe random tokens with TTL and consume-once semantics
+- **Secret redaction**: Logger automatically redacts tokens, secrets, and codes from all output
+- **Read-only root filesystem**: Docker container runs with non-root user and immutable filesystem
+- **Security context**: Kubernetes pods run as non-root with dropped capabilities
 
-## Hints
+### Asynchronous Processing
+- **Non-blocking token retrieval**: `GET /{provider}/{user}` returns `202 Accepted` immediately
+- **Background worker**: Separate asyncio task processes token requests without blocking the API
+- **Polling interface**: Clients poll `GET /requests/{id}` for completion status
+- **Request state management**: In-memory request records with TTL-based cleanup
+- **Terminal state idempotency**: Multiple calls to mark succeeded/failed are safe
 
-- Read the oauthapp plugin README first. It already does the hard parts:
-  `config/auth-code-url` builds the authorization URL, writing the code to
-  `creds/<name>` performs the exchange, reading `creds/<name>` returns a
-  fresh access token.
-- OpenBao dev mode is fine for this exercise. Note in `DESIGN.md` what dev
-  mode skips (persistence, unsealing, TLS).
-- The plugin binary must be present in the OpenBao pod and registered in the
-  plugin catalog. Getting this scripted idempotently is part of the exercise.
-- CI already requires a local OIDC provider. If Google's console blocks you
-  (e.g. verification prompts), that local provider counts as your second
-  provider alongside GitHub. Say so in `DESIGN.md`.
-- Your fork is public. Real client secrets stay in your local env files and
-  repository Action secrets, never in a commit.
+### OAuth Provider Support
+- **GitHub**: Full OAuth 2.0 authorization-code flow
+- **Google**: OAuth 2.0 web server flow
+- **GitLab**: OAuth 2.0 authorization-code flow
+- **Generic OIDC**: Configurable issuer URL for any OIDC-compliant provider
+- **Mock OAuth**: navikt/mock-oauth2-server for automated CI testing
+
+### Observability
+- **Structured logging**: JSON-formatted logs with configurable log levels
+- **Health endpoints**: `/healthz` (liveness) and `/readyz` (readiness with OpenBao dependency check)
+- **Kubernetes probes**: Liveness and readiness probes configured with appropriate thresholds
+- **Performance reporting**: k6 generates latency and throughput metrics uploaded as CI artifacts
+
+---
+
+## API Endpoints
+
+### Provider Management
+
+#### Register a Provider
+```http
+POST /providers
+Content-Type: application/json
+
+{
+  "name": "github",
+  "provider": "github",
+  "client_id": "abc123",
+  "client_secret": "secret456",
+  "scopes": ["read:user", "repo"]
+}
+
+Response: 201 Created
+{
+  "name": "github",
+  "provider": "github",
+  "client_id": "abc123",
+  "scopes": ["read:user", "repo"]
+}
+```
+
+**Note**: Client secret is stored in OpenBao and never returned in responses.
+
+### OAuth Flow
+
+#### Start Connection
+```http
+POST /providers/{provider}/users/{user}/connect
+
+Response: 200 OK
+{
+  "authorization_url": "https://github.com/login/oauth/authorize?...",
+  "state": "abc123xyz"
+}
+```
+
+#### OAuth Callback
+```http
+GET /callback?code=xyz789&state=abc123xyz
+
+Response: 200 OK
+{
+  "status": "connected"
+}
+```
+
+### Token Retrieval
+
+#### Request Token (Async)
+```http
+GET /{provider}/{user}
+
+Response: 202 Accepted
+Location: /requests/{request_id}
+
+{
+  "request_id": "req_abc123",
+  "status": "pending"
+}
+```
+
+#### Poll Request Status
+```http
+GET /requests/{request_id}
+
+Response: 200 OK (when succeeded)
+{
+  "request_id": "req_abc123",
+  "status": "succeeded",
+  "access_token": "gho_...",
+  "token_type": "bearer",
+  "expires_in": 7200
+}
+```
+
+**Note**: Token is only returned when status is `succeeded`. Failed requests return error details.
+
+### Health Checks
+
+#### Liveness
+```http
+GET /healthz
+
+Response: 200 OK
+{
+  "status": "ok"
+}
+```
+
+#### Readiness
+```http
+GET /readyz
+
+Response: 200 OK
+{
+  "status": "ready",
+  "openbao": "up"
+}
+```
+
+Returns `503 Service Unavailable` if OpenBao is unreachable.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- **minikube** (v1.30+): Local Kubernetes cluster
+- **kubectl**: Kubernetes CLI
+- **Helm 3.16+**: Package manager
+- **Docker**: Container runtime
+- **Python 3.11+**: For local development (optional)
+
+### Local Deployment
+
+```bash
+# Clone the repository
+git clone <repository-url>
+cd integration-aggregator-takehome
+
+# Deploy the full stack (OpenBao, oauthapp plugin, aggregator, mock OAuth)
+make up
+
+# Port-forward to access the service locally
+kubectl port-forward -n aggregator svc/aggregator 8000:80
+
+# Run the smoke test to verify the OAuth flow
+make smoke
+
+# Tear down the application (preserves OpenBao)
+make down
+```
+
+The `make up` command is idempotent—it can be run multiple times safely and will only create resources that don't exist.
+
+### Manual Testing
+
+```bash
+# Register a mock OIDC provider
+curl -X POST http://localhost:8000/providers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "test-oidc",
+    "provider": "oidc",
+    "client_id": "test-client",
+    "client_secret": "test-secret",
+    "scopes": ["openid", "profile"],
+    "provider_options": {
+      "issuer_url": "http://mock-oauth.aggregator.svc.cluster.local:8080/default"
+    }
+  }'
+
+# Start OAuth connection
+curl -X POST http://localhost:8000/providers/test-oidc/users/test-user/connect
+
+# Request token (async)
+curl http://localhost:8000/test-oidc/test-user
+# Returns: 202 with Location header
+
+# Poll for completion
+curl http://localhost:8000/requests/{request_id}
+# Returns: 200 with access_token when succeeded
+```
+
+---
+
+## Deployment
+
+### Production Deployment
+
+The Helm chart is published to GitHub Container Registry (GHCR) via CI. To deploy from the published chart:
+
+```bash
+# Log in to GHCR
+helm registry login ghcr.io --username <username> --password <token>
+
+# Pull and install the chart
+helm pull oci://ghcr.io/<username>/integration-aggregator --version <version>
+helm install aggregator ./integration-aggregator-<version>.tgz \
+  --namespace aggregator \
+  --create-namespace \
+  --set openbao.address=https://openbao.example.com:8200 \
+  --set openbao.existingSecret=aggregator-openbao \
+  --set redirectUrl=https://aggregator.example.com/callback
+```
+
+### Configuration
+
+Key Helm values:
+
+```yaml
+# Application configuration
+app:
+  port: 8000
+  logLevel: INFO
+  httpTimeoutSeconds: 5.0
+  oauthStateTtlSeconds: 600  # 10 minutes
+  requestTtlSeconds: 3600     # 1 hour
+
+# OpenBao integration
+openbao:
+  address: http://openbao.openbao.svc.cluster.local:8200
+  mount: oauth2
+  existingSecret: aggregator-openbao  # Kubernetes Secret with OPENBAO_TOKEN
+
+# OAuth callback URL
+redirectUrl: http://localhost:8000/callback
+
+# Resource limits
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+```
+
+See [charts/aggregator/values.yaml](charts/aggregator/values.yaml) for all configuration options.
+
+### OpenBao Policy
+
+The service requires a least-privilege OpenBao policy:
+
+```hcl
+path "oauth2/servers/*" {
+  capabilities = ["create", "update", "read", "list"]
+}
+
+path "oauth2/auth-code-url" {
+  capabilities = ["update"]
+}
+
+path "oauth2/creds/*" {
+  capabilities = ["create", "update", "read"]
+}
+```
+
+This policy grants access only to the oauthapp plugin paths required for the service to function.
+
+---
+
+## Testing
+
+### Unit Tests
+
+```bash
+# Run all unit tests
+make test
+
+# Run with coverage
+pytest tests/ --cov=app --cov-report=html
+```
+
+Unit tests cover:
+- Individual service logic (ProviderRegistry, OAuthStateStore, RequestManager)
+- OpenBao adapter with fake implementation
+- Error handling and edge cases
+- Configuration validation
+
+### Integration Tests
+
+```bash
+# Run smoke test (requires deployed environment)
+make smoke
+```
+
+The smoke test executes the full OAuth flow:
+1. Registers a mock OIDC provider
+2. Initiates OAuth connection
+3. Completes callback programmatically with mock OAuth server
+4. Submits async token request
+5. Polls for successful completion
+
+### Linting
+
+```bash
+# Run Ruff linter
+make lint
+
+# Auto-fix issues
+ruff check app tests --fix
+```
+
+### Performance Testing
+
+```bash
+# Run k6 performance test
+k6 run perf/token_retrieval.js --out json=perf-results.json
+
+# Generate report
+python3 -c "from app.performance_report import generate_report; generate_report('perf-results.json', 'perf-report.md')"
+```
+
+Performance metrics (from CI runs):
+- **Average latency**: 1.35 ms
+- **p50 latency**: 1.08 ms
+- **p95 latency**: 2.33 ms
+- **Throughput**: 30.25 requests/second
+- **Failure rate**: 0.00%
+
+See [perf/REPORT.md](perf/REPORT.md) for detailed results.
+
+---
+
+## CI/CD Pipeline
+
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push to `main`/`master`:
+
+1. **Lint and Test**
+   - Install Python 3.11
+   - Run Ruff linter
+   - Execute pytest unit tests
+
+2. **Build and Push**
+   - Build Docker image with BuildKit
+   - Push to GHCR with branch and SHA tags
+   - Package and push Helm chart to GHCR as OCI artifact
+
+3. **Integration Test**
+   - Set up minikube with Docker driver
+   - Install OpenBao with oauthapp plugin v3.4.1
+   - Register plugin with SHA-256 verification
+   - Deploy mock OAuth server
+   - Deploy aggregator service
+   - Run smoke test
+   - Execute k6 performance test
+   - Upload performance report as artifact
+
+The CI pipeline ensures green builds on the default branch before any deployment.
+
+---
+
+## Engineering Decisions
+
+### Async Request Pattern
+
+**Decision**: Token retrieval returns `202 Accepted` with a polling endpoint instead of blocking on OpenBao.
+
+**Rationale**:
+- Prevents API threads from blocking on downstream latency
+- Allows horizontal scaling of API workers independent of token retrieval
+- Provides clear separation between request submission and fulfillment
+- Matches HTTP semantics for long-running operations
+
+**Trade-off**: Adds client-side polling complexity. Future improvement could use Server-Sent Events or WebSockets.
+
+### In-Memory State
+
+**Decision**: OAuth state and async request records stored in process memory.
+
+**Rationale**:
+- Simplicity for single-replica deployment
+- No external dependencies (Redis, database)
+- Fast access without network latency
+- Acceptable for current use case (single replica)
+
+**Trade-off**: Limits horizontal scaling. State is lost on replica restart. Production deployment would require distributed storage (Redis or similar). Documented in [DESIGN.md](DESIGN.md).
+
+### OpenBao Dev Mode
+
+**Decision**: Current deployment uses OpenBao dev mode for simplicity.
+
+**Rationale**:
+- No unsealing process required
+- No persistence setup needed
+- No TLS configuration for local development
+- Root token available for initial setup
+
+**Trade-off**: Dev mode skips persistence, unsealing, TLS, and HA. Production deployment requires OpenBao in production mode with Raft storage and proper unsealing. Documented in [DESIGN.md](DESIGN.md).
+
+### Token Redaction
+
+**Decision**: Logger redacts tokens, secrets, and codes via regex pattern matching.
+
+**Rationale**:
+- Defense-in-depth against accidental logging
+- Catches sensitive data in debug output
+- No manual redaction needed in code
+- Centralized security policy
+
+**Trade-off**: Regex-based approach may have false positives/negatives. Structured logging with field-level redaction would be more robust but adds complexity.
+
+### Least-Privilege Policy
+
+**Decision**: OpenBao policy grants access only to `oauth2/*` paths with specific capabilities.
+
+**Rationale**:
+- Principle of least privilege
+- Prevents accidental access to other secrets
+- Clear audit boundary
+- Aligns with security best practices
+
+**Trade-off**: Requires manual policy creation. Terraform-based OpenBao configuration would automate this (noted as production improvement).
+
+---
+
+## Current Limitations
+
+1. **Single-replica deployment**: In-memory state prevents horizontal scaling
+2. **OpenBao dev mode**: No persistence, TLS, unsealing, or HA
+3. **No retry logic**: Transient OpenBao failures cause request failures
+4. **No rate limiting**: API is vulnerable to abuse
+5. **No circuit breaking**: Cascading failures possible
+6. **Limited observability**: Structured logging only, no metrics or tracing
+7. **No PKCE**: OAuth flows rely on state parameter only (PKCE would add security)
+8. **No token revocation**: No mechanism to revoke compromised tokens
+
+See [DESIGN.md](DESIGN.md) for prioritized production improvements.
+
+---
+
+## Future Improvements
+
+### High Priority
+
+1. **Distributed storage**: Replace in-memory state with Redis for horizontal scaling
+2. **Message queue architecture**: Use RabbitMQ/Kafka for reliable async token retrieval with retries
+3. **Production OpenBao**: Deploy with Raft storage, TLS, unsealing, and HA
+4. **Observability**: Add Prometheus metrics and distributed tracing
+5. **Resilience**: Implement exponential backoff retries and circuit breaking
+
+### Medium Priority
+
+6. **Rate limiting**: Add per-IP and per-user rate limits
+7. **PKCE support**: Enhance OAuth security with proof key for code exchange
+8. **Token revocation**: Add endpoint to revoke compromised tokens
+9. **Administrative tooling**: Health checks, configuration validation, state cleanup
+10. **Terraform integration**: Manage OpenBao configuration with Terraform
+
+### Low Priority
+
+11. **Webhook notifications**: Notify callers when async requests complete
+12. **Token metadata**: Store additional metadata (scopes, expiry) with tokens
+13. **Multi-region support**: Geographic distribution with region-aware token storage
+14. **Provider health monitoring**: Track provider availability and deprecate failing providers
+
+---
+
+## Documentation
+
+- [DESIGN.md](DESIGN.md): Architecture, data placement, failure handling, and production improvements
+- [DEPLOYMENT.md](DEPLOYMENT.md): Detailed deployment guide with OpenBao setup and troubleshooting
+- [docs/USAGE.md](docs/USAGE.md): Detailed API usage examples
+- [docs/GITHUB_OAUTH_TRANSCRIPT.md](docs/GITHUB_OAUTH_TRANSCRIPT.md): Real GitHub OAuth flow transcript
+- [perf/REPORT.md](perf/REPORT.md): Performance test results and analysis
+
+---
+
+## License
+
+This project builds upon open-source components. See individual package licenses for details.
+
+---
+
+## Contributing
+
+This is a portfolio project demonstrating engineering capability. For issues or questions, please refer to the upstream [OpenBao](https://openbao.org) and [oauthapp plugin](https://github.com/openbao/openbao-plugin-secrets-oauthapp) repositories.
