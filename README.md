@@ -44,7 +44,7 @@ graph TB
     end
 
     Client[Internal Services]
-    Provider[OAuth Providers<br/>GitHub, Google, GitLab]
+    Provider[OAuth Providers]
 
     Client -->|HTTP| API
     API -->|Plugin API| OB
